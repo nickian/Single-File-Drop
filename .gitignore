@@ -1,0 +1,15 @@
+# Ignore the directory for file uploads and thumbnails
+files/
+
+# Ignore common macOS system files
+.DS_Store
+
+# Ignore common Windows system files
+Thumbs.db
+
+# Ignore common IDE/editor specific folders (optional, but good practice)
+.vscode/
+.idea/
+
+# Ignore common log files if any are generated locally (application currently logs via error_log)
+*.log 
