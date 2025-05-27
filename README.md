@@ -10,10 +10,12 @@ Single File Drop is a simple, self-hosted, single-file PHP application for secur
 *   **Password Protection:** Secure your file drop with a hashed password.
 *   **File Uploads:** Drag-and-drop or browse to upload files.
     *   Configurable maximum file size and total storage limits.
-    *   Filename sanitization and duplicate handling.
+    *   Filename sanitization (preserves more original characters like spaces, still secure) and duplicate handling.
 *   **File Management:**
     *   List and icon views for browsing files.
     *   Sort files by name, date, or size.
+    *   Calculates and displays the size of folders, similar to individual files.
+    *   Rename files and folders.
     *   Delete individual files or selected multiple files (configurable).
     *   Download all files as a ZIP archive.
     *   Download selected files as a ZIP archive.

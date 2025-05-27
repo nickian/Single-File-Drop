@@ -93,20 +93,24 @@ function sanitizeFilename($filename) {
     $name_part = pathinfo($raw_basename, PATHINFO_FILENAME);
 
     // 3. Sanitize the name_part:
-    //    a. Remove all dots from the name_part. (e.g., "my.file.name" -> "myfilename")
-    $name_part = str_replace('.', '', $name_part);
-    
-    //    b. Replace any non-alphanumeric (excluding hyphen, allowing underscore already there or from replacement)
+    //    a. Allow dots in the name_part. (Previously removed all dots)
+    //    $name_part = str_replace('.', '', $name_part); // Keep dots for now
+
+    //    b. Replace any characters NOT in the allowed set (alphanumeric, space, common punctuation)
     //       with an underscore.
-    $name_part = preg_replace('/[^a-zA-Z0-9_-]/', '_', $name_part);
+    //       Allowed: a-z, A-Z, 0-9, space, hyphen, underscore, period, parentheses, square brackets, comma
+    $name_part = preg_replace('/[^a-zA-Z0-9 _\\-.()[\]\\,]/', '_', $name_part);
     
-    //    c. Consolidate multiple underscores resulting from replacements.
+    //    c. Consolidate multiple spaces into single spaces.
+    $name_part = preg_replace('/\\s+/', ' ', $name_part);
+
+    //    d. Consolidate multiple underscores into single underscores.
     $name_part = preg_replace('/_+/', '_', $name_part);
     
-    //    d. Remove leading/trailing underscores from the name_part.
-    $name_part = trim($name_part, '_');
+    //    e. Remove leading/trailing underscores and spaces from the name_part.
+    $name_part = trim($name_part, '_ ');
 
-    // 4. If name_part became empty after all sanitization (e.g., original name was "..."), provide a default.
+    // 4. If name_part became empty after all sanitization (e.g., original name was "..." or just spaces/underscores), provide a default.
     if (empty($name_part)) {
         $name_part = 'file'; // Default name if original name part is entirely removed
     }
@@ -201,7 +205,7 @@ function validateFileType($filename, $tmpFile) {
     // Check extension
     $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
     if (!in_array($ext, $ALLOWED_EXTENSIONS)) {
-        return false;
+        return "File extension '$ext' is not allowed.";
     }
     
     // Check MIME type
@@ -211,31 +215,33 @@ function validateFileType($filename, $tmpFile) {
         finfo_close($finfo);
         
         if (!in_array($mimeType, $ALLOWED_MIME_TYPES)) {
-             // Allow generic octet-stream for some types if extension matches
             if ($mimeType === 'application/octet-stream') {
-                $genericAllowedExt = ['zip', 'rar', '7z', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx']; // Add other extensions that might be served as octet-stream
+                $genericAllowedExt = ['zip', 'rar', '7z', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx']; 
                 if (!in_array($ext, $genericAllowedExt)) {
-                    error_log("MIME type mismatch for extension .$ext: detected $mimeType (generic), not specifically allowed.");
-                    // return false; // Be stricter here if needed
+                    error_log("MIME type mismatch for extension .$ext: detected $mimeType (generic), not specifically allowed for this extension type.");
+                    return "File type ($mimeType for .$ext) is not allowed due to MIME type mismatch (generic type not permitted for this extension).";
                 }
+                // If it is an allowed generic octet-stream, we let it pass for now, relying on extension.
             } else {
-                error_log("MIME type mismatch for extension .$ext: detected $mimeType, not in allowed list.");
-                // return false; // Uncomment if you want to be very strict
+                error_log("MIME type mismatch for extension .$ext: detected $mimeType, not in allowed list: " . implode(', ', $ALLOWED_MIME_TYPES));
+                return "File type ($mimeType for .$ext) is not allowed due to server MIME type policy.";
             }
         }
     } else {
-        // Fallback if finfo is not available (less secure)
-        // Consider warning the admin or disabling uploads
-        error_log("finfo_open function not available. MIME type validation is less secure.");
+        error_log("finfo_open function not available. MIME type validation is less secure. Relying on extension only for file: " . $filename);
+        // If finfo is not available, we can't perform robust MIME check. 
+        // For security, one might choose to reject or be more cautious. 
+        // Current behavior: falls through, relying on extension & PHP content check.
     }
     
     // Additional check for PHP files
-    $content = file_get_contents($tmpFile, false, null, 0, 512); // Read first 512 bytes
-    if (preg_match('/<\?php|<\?=|<\?/i', $content)) {
-        return false;
+    $content = @file_get_contents($tmpFile, false, null, 0, 1024); // Read first 1KB for broader check
+    if ($content !== false && preg_match('/^(<\?php|<\?=|<\?|\\b(eval|system|exec|passthru|shell_exec|proc_open|popen)\s*\\()/i', $content)) {
+        error_log("Potential PHP or shell execution content detected in file: " . $filename);
+        return "File appears to contain prohibited script content.";
     }
     
-    return true;
+    return true; // File is valid
 }
 
 // SECURITY: Check disk space to prevent DoS
@@ -258,41 +264,177 @@ function checkDiskSpace($size) {
 }
 
 // SECURITY: Create .htaccess to prevent PHP execution
-function createHtaccess() {
+function createHtaccessInDirectory($directoryPath) {
+    // Ensure the path is within the main files directory for safety, though this function
+    // should ideally be called with already validated paths.
     global $FILES_DIR;
-    
-    $htaccess = $FILES_DIR . '/.htaccess';
+    $realBaseFilesDir = realpath($FILES_DIR);
+    // realpath() returns false if the path does not exist. We might be creating it.
+    // So, construct the prospective real path and check its prefix.
+    $prospectiveRealPath = $realBaseFilesDir . DIRECTORY_SEPARATOR . str_replace($realBaseFilesDir, '', $directoryPath);
+    $prospectiveRealPath = str_replace(DIRECTORY_SEPARATOR . DIRECTORY_SEPARATOR, DIRECTORY_SEPARATOR, $prospectiveRealPath); // Normalize separators
+
+    // A more direct check if $directoryPath is already absolute and resolved:
+    if (strpos(realpath($directoryPath), $realBaseFilesDir) !== 0 && realpath($directoryPath) !== $realBaseFilesDir) {
+         // If $directoryPath hasn't been created yet, realpath will fail. 
+         // This check is more for post-creation validation or if path is assumed to exist.
+         // For pre-creation, ensure $directoryPath is constructed safely from $FILES_DIR
+    }
+
+    $htaccess = rtrim($directoryPath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . '.htaccess';
     if (!file_exists($htaccess)) {
         $content = "# Prevent PHP execution\n";
         $content .= "<FilesMatch \"\\.(php|phtml|php3|php4|php5|pl|py|jsp|asp|htm|shtml|sh|cgi)$\">\n";
         $content .= "    SetHandler text/plain\n";
         $content .= "</FilesMatch>\n";
         $content .= "Options -ExecCGI -Indexes\n";
-        // Deny access to .htaccess itself
         $content .= "<Files .htaccess>\n";
         $content .= "    Order allow,deny\n";
         $content .= "    Deny from all\n";
         $content .= "</Files>\n";
-        file_put_contents($htaccess, $content);
+        @file_put_contents($htaccess, $content);
     }
+}
+
+// Helper to create index.html in a directory to prevent listing
+function createIndexHtmlInDirectory($directoryPath) {
+    // Similar safety checks as createHtaccessInDirectory might be useful if called directly with untrusted paths
+    // but ensureSecurePath should handle path construction safely.
+    $indexFile = rtrim($directoryPath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'index.html';
+    if (!file_exists($indexFile)) {
+        @file_put_contents($indexFile, '<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1></body></html>');
+    }
+}
+
+// Function to recursively create and secure directories
+function ensureSecurePath($baseDir, $relativePath) {
+    global $FILES_DIR; // To check if we are creating within $FILES_DIR for .htaccess
+    $fullPath = rtrim($baseDir, DIRECTORY_SEPARATOR);
+
+    // Normalize relativePath, remove leading/trailing slashes, replace backslashes
+    $relativePath = trim(str_replace('\\', '/', $relativePath), '/');
+
+    if (!empty($relativePath)) {
+        $segments = explode('/', $relativePath);
+    } else {
+        $segments = [];
+    }
+
+    $currentPathAbs = $fullPath; // Start with the base directory absolute path
+
+    // First, ensure the base directory itself exists.
+    if (!is_dir($currentPathAbs)) {
+        if (!@mkdir($currentPathAbs, 0755, true)) {
+            error_log("Failed to create base directory: " . $currentPathAbs);
+            return false;
+        }
+        // Secure the base $FILES_DIR itself if it was just created and $baseDir is $FILES_DIR
+        if (realpath($currentPathAbs) === realpath($FILES_DIR)) { 
+            createHtaccessInDirectory($currentPathAbs);
+            createIndexHtmlInDirectory($currentPathAbs);
+        }
+    }
+
+    // Iterate through segments of the relative path
+    foreach ($segments as $segment) {
+        if (empty($segment) || $segment === '.' || $segment === '..') { // Basic sanitization for segments
+            error_log("Invalid segment in path creation: " . $segment);
+            return false; // Disallow dangerous segments
+        }
+        $currentPathAbs .= DIRECTORY_SEPARATOR . $segment;
+        if (!is_dir($currentPathAbs)) {
+            if (!@mkdir($currentPathAbs, 0755)) { // Create one segment at a time, not recursive here
+                error_log("Failed to create subdirectory: " . $currentPathAbs);
+                return false; 
+            }
+            // Secure newly created subdirectory if it's within $FILES_DIR
+            $realCurrentPathAbs = realpath($currentPathAbs);
+            $realBaseFilesDir = realpath($FILES_DIR);
+            if ($realCurrentPathAbs !== false && $realBaseFilesDir !== false && strpos($realCurrentPathAbs, $realBaseFilesDir) === 0) {
+                 createHtaccessInDirectory($currentPathAbs);
+                 createIndexHtmlInDirectory($currentPathAbs);
+            }
+        }
+    }
+    return realpath($fullPath . (empty($segments) ? '' : DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, $segments)));
+}
+
+// Recursive function to delete a directory and its contents
+function deleteDirectoryRecursive($dirPath) {
+    global $FILES_DIR, $THUMBS_DIR; // For path validation
+    $realBaseFilesDir = realpath($FILES_DIR);
+    $realDirPath = realpath($dirPath);
+
+    // Security: Ensure we are within $FILES_DIR or $THUMBS_DIR
+    $isValidPath = false;
+    if ($realBaseFilesDir && $realDirPath && strpos($realDirPath, $realBaseFilesDir) === 0) {
+        $isValidPath = true;
+    }
+    if (!$isValidPath) {
+        $realBaseThumbsDir = realpath($THUMBS_DIR);
+        if ($realBaseThumbsDir && $realDirPath && strpos($realDirPath, $realBaseThumbsDir) === 0) {
+            $isValidPath = true;
+        }
+    }
+
+    if (!$isValidPath || $realDirPath === $realBaseFilesDir || $realDirPath === realpath($THUMBS_DIR)) {
+        error_log("Attempt to delete invalid or root directory: " . $dirPath . " (Resolved: " . $realDirPath . ")");
+        return false; // Do not delete the root files/thumbs directory itself
+    }
+
+    if (!is_readable($dirPath)) { // Check if readable before scandir
+        error_log("Directory not readable, cannot delete: " . $dirPath);
+        return false;
+    }
+
+    $items = scandir($dirPath);
+    if ($items === false) {
+        error_log("Failed to scan directory for deletion: " . $dirPath);
+        return false;
+    }
+
+    foreach ($items as $item) {
+        if ($item == '.' || $item == '..') {
+            continue;
+        }
+        $path = $dirPath . DIRECTORY_SEPARATOR . $item;
+        if (is_dir($path)) {
+            if (!deleteDirectoryRecursive($path)) {
+                return false; // Stop if a subdirectory deletion fails
+            }
+        } else {
+            if (!@unlink($path)) {
+                error_log("Failed to delete file: " . $path);
+                return false; // Stop if a file deletion fails
+            }
+        }
+    }
+    if (!@rmdir($dirPath)) {
+        error_log("Failed to remove directory: " . $dirPath);
+        return false;
+    }
+    return true;
 }
 
 // Initialize directories with security
 if (!file_exists($FILES_DIR)) {
-    mkdir($FILES_DIR, 0755, true);
-    createHtaccess();
+    ensureSecurePath($FILES_DIR, ''); 
 }
 if (!file_exists($THUMBS_DIR)) {
-    mkdir($THUMBS_DIR, 0755, true);
-}
-
-// Create index.html files to prevent directory listing
-foreach ([$FILES_DIR, $THUMBS_DIR] as $dir) {
-    $indexFile = $dir . '/index.html';
-    if (!file_exists($indexFile)) {
-        file_put_contents($indexFile, '<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1></body></html>');
+    if (@mkdir($THUMBS_DIR, 0755, true)) {
+        createIndexHtmlInDirectory($THUMBS_DIR); 
     }
 }
+
+// This original loop for index.html is largely covered by ensureSecurePath and the direct THUMBS_DIR init.
+// Keeping it commented out as it might be redundant or conflict.
+/*
+foreach ([$FILES_DIR, $THUMBS_DIR] as $dir) {
+    if (is_dir($dir)) { 
+        createIndexHtmlInDirectory($dir);
+    }
+}
+*/
 
 // Handle authentication
 if ($PASSWORD_PROTECTION && !isset($_SESSION['authenticated'])) {
@@ -358,6 +500,12 @@ if (isset($_POST['action'])) {
             //     );
             // }
             echo json_encode(['success' => true]);
+            break;
+        case 'create_folder': // New action for creating a folder
+            handleCreateFolder();
+            break;
+        case 'rename': // New action for renaming
+            handleRename();
             break;
         case 'login':
             if ($PASSWORD_PROTECTION && password_verify($_POST['password'], $PASSWORD_HASH)) {
@@ -542,6 +690,59 @@ function handleUpload() {
            $FFMPEG_ENABLED, $FFMPEG_PATH, $VIDEO_PREVIEW_EXTENSIONS, 
            $PDF_THUMB_ENABLED;
     
+    $uiCurrentPathInput = $_POST['currentDirectoryPath'] ?? ''; // Path from UI navigation
+    $fileIntendedSubPathInput = $_POST['intendedSubPath'] ?? '';    // Path from dropped folder structure or just filename
+
+    // --- Path Sanitization and Combination --- 
+    $baseFilesDirReal = realpath($FILES_DIR);
+    if ($baseFilesDirReal === false) {
+        echo json_encode(['success' => false, 'error' => 'Server configuration error: Invalid FILES_DIR']); return;
+    }
+
+    // 1. Sanitize uiCurrentPathInput (path active in UI)
+    $sanitizedUiPath = '';
+    if ($uiCurrentPathInput !== '') {
+        $normalizedUiPath = trim(str_replace('\\', '/', $uiCurrentPathInput), '/');
+        if (strpos($normalizedUiPath, '..') === false) {
+            $prospectiveUiPath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $normalizedUiPath;
+            if (realpath($prospectiveUiPath) !== false && strpos(realpath($prospectiveUiPath), $baseFilesDirReal) === 0) {
+                $sanitizedUiPath = $normalizedUiPath;
+            }
+        }
+    }
+
+    // 2. Sanitize fileIntendedSubPathInput (path from dropped item, relative to itself or just filename)
+    // This path might contain subdirectories if a folder was dropped.
+    $sanitizedFileSubPath = '';
+    $actualFileName = pathinfo($fileIntendedSubPathInput, PATHINFO_BASENAME);
+    $intendedDirStructureWithinFile = pathinfo($fileIntendedSubPathInput, PATHINFO_DIRNAME);
+
+    if ($intendedDirStructureWithinFile === '.' || $intendedDirStructureWithinFile === '/') {
+        $intendedDirStructureWithinFile = '';
+    }
+    if ($intendedDirStructureWithinFile !== '') {
+         $normalizedIntendedDir = trim(str_replace('\\', '/', $intendedDirStructureWithinFile), '/');
+         if (strpos($normalizedIntendedDir, '..') === false) {
+             $sanitizedFileSubPath = $normalizedIntendedDir;
+         }
+    }
+    // If fileIntendedSubPathInput was just a filename, $sanitizedFileSubPath remains ''
+
+    // 3. Combine paths: UI path + path from dropped folder structure
+    $finalTargetSubDirRelative = $sanitizedUiPath;
+    if (!empty($sanitizedFileSubPath)) {
+        $finalTargetSubDirRelative = ($finalTargetSubDirRelative ? $finalTargetSubDirRelative . '/' : '') . $sanitizedFileSubPath;
+    }
+    $finalTargetSubDirRelative = trim($finalTargetSubDirRelative, '/');
+
+    // Ensure the target upload directory exists and is secure
+    $finalUploadDirPathAbsolute = ensureSecurePath($FILES_DIR, $finalTargetSubDirRelative);
+    if ($finalUploadDirPathAbsolute === false) {
+        echo json_encode(['success' => false, 'error' => 'Failed to create or secure upload subdirectory for the file.']);
+        return;
+    }
+    // --- End Path Sanitization and Combination ---
+
     if (!isset($_FILES['file'])) {
         echo json_encode(['success' => false, 'error' => 'No file uploaded']);
         return;
@@ -549,43 +750,99 @@ function handleUpload() {
     
     $file = $_FILES['file'];
     
-    // SECURITY: Check file size
+    // SECURITY: Check file size (remains important)
     if ($file['size'] > $MAX_FILE_SIZE) {
         echo json_encode(['success' => false, 'error' => 'File too large. Maximum size is ' . ($MAX_FILE_SIZE / 1024 / 1024) . 'MB']);
         return;
     }
     
-    // SECURITY: Check if we have disk space
+    // SECURITY: Check if we have disk space (remains important)
     if (!checkDiskSpace($file['size'])) {
         echo json_encode(['success' => false, 'error' => 'Storage limit exceeded']);
         return;
     }
     
-    // SECURITY: Sanitize filename
-    $fileName = sanitizeFilename($file['name']);
-    if (empty($fileName)) {
-        echo json_encode(['success' => false, 'error' => 'Invalid filename']);
+    // Use the BASENAME from intendedSubPath for the actual filename part
+    $fileNameFromClient = sanitizeFilename($actualFileName); 
+    if (empty($fileNameFromClient)) {
+        echo json_encode(['success' => false, 'error' => 'Invalid filename after sanitization.']);
         return;
     }
     
-    // SECURITY: Validate file type
-    if (!validateFileType($fileName, $file['tmp_name'])) {
-        echo json_encode(['success' => false, 'error' => 'File type not allowed or potential security risk.']);
+    // SECURITY: Validate file type 
+    $validationResult = validateFileType($fileNameFromClient, $file['tmp_name']);
+    if ($validationResult !== true) {
+        echo json_encode(['success' => false, 'error' => $validationResult]);
         return;
     }
     
-    $targetPath = $FILES_DIR . '/' . $fileName;
-    
-    // Handle duplicate filenames
-    $counter = 1;
-    $originalName = $fileName;
-    while (file_exists($targetPath)) {
-        $info = pathinfo($originalName);
-        $newName = $info['filename'] . '_' . $counter . '.' . $info['extension'];
-        $targetPath = $FILES_DIR . '/' . $newName;
-        $fileName = $newName; // Update fileName to be the new unique name
-        $counter++;
+    $targetPath = $finalUploadDirPathAbsolute . DIRECTORY_SEPARATOR . $fileNameFromClient;
+    $overwriteAction = $_POST['overwrite_action'] ?? null;
+    $userSuggestedNameInput = $_POST['userSuggestedName'] ?? null;
+
+    // Check for file existence if no overwrite action is specified yet
+    if (!$overwriteAction && file_exists($targetPath)) {
+        echo json_encode([
+            'success' => 'conflict', 
+            'filename' => $fileNameFromClient, 
+            'message' => "File '{$fileNameFromClient}' already exists in the target directory ('{$finalTargetSubDirRelative}').",
+            // We need to send back enough info for the client to re-initiate if needed.
+            // However, sending back tmp_name is not ideal for security/state if we were to hold it.
+            // The re-upload strategy means client just needs the filename and original context.
+        ]);
+        return;
     }
+
+    $fileName = $fileNameFromClient; // Initialize $fileName with the client-provided (and sanitized) name
+
+    // Handle renaming or use user-suggested name
+    if ($overwriteAction === 'rename') {
+        $baseNameToRename = $fileNameFromClient; // Default to original filename for renaming
+        if ($userSuggestedNameInput !== null && trim($userSuggestedNameInput) !== '') {
+            // Sanitize userSuggestedNameInput like a filename (no paths, just the name part)
+            $sanitizedUserSuggestion = sanitizeFilename(basename(trim($userSuggestedNameInput))); 
+            if (!empty($sanitizedUserSuggestion)) {
+                $baseNameToRename = $sanitizedUserSuggestion;
+            }
+        }
+        
+        $counter = 1;
+        $originalNameForLoop = $baseNameToRename; 
+        $info = pathinfo($originalNameForLoop);
+        $fileName = $info['filename'] . '_' . $counter . (isset($info['extension']) ? '.' . $info['extension'] : '');
+        $targetPath = $finalUploadDirPathAbsolute . DIRECTORY_SEPARATOR . $fileName;
+        while (file_exists($targetPath)) {
+            $counter++;
+            $fileName = $info['filename'] . '_' . $counter . (isset($info['extension']) ? '.' . $info['extension'] : '');
+            $targetPath = $finalUploadDirPathAbsolute . DIRECTORY_SEPARATOR . $fileName;
+        }
+    } elseif ($overwriteAction === 'replace') {
+        // $targetPath is already $finalUploadDirPathAbsolute . DIRECTORY_SEPARATOR . $fileNameFromClient;
+        // $fileName is $fileNameFromClient by default initialization.
+    } else if (!$overwriteAction && file_exists($targetPath)) {
+        // This case should have been caught by the 'conflict' response.
+        // If somehow reached, this is implicit rename (original behavior for non-conflict-aware client)
+        // For safety, log it if it happens.
+        error_log("Warning: Reached implicit renaming fallback in handleUpload for existing file: " . $targetPath);
+        $counter = 1;
+        $originalNameForLoop = $fileNameFromClient;
+        $info = pathinfo($originalNameForLoop);
+        $fileName = $info['filename'] . '_' . $counter . (isset($info['extension']) ? '.' . $info['extension'] : '');
+        $targetPath = $finalUploadDirPathAbsolute . DIRECTORY_SEPARATOR . $fileName;
+        while (file_exists($targetPath)) {
+            $counter++;
+            $fileName = $info['filename'] . '_' . $counter . (isset($info['extension']) ? '.' . $info['extension'] : '');
+            $targetPath = $finalUploadDirPathAbsolute . DIRECTORY_SEPARATOR . $fileName;
+        }
+    } else {
+        // No conflict and no specific action: $targetPath is already correct using $fileNameFromClient
+        // $fileName is also $fileNameFromClient
+    }
+    // Ensure $targetPath is correctly set if it wasn't in a rename loop
+    if ($overwriteAction !== 'rename') {
+         $targetPath = $finalUploadDirPathAbsolute . DIRECTORY_SEPARATOR . $fileName; 
+    }
+
     
     if (move_uploaded_file($file['tmp_name'], $targetPath)) {
         // Create thumbnail if it's an image or a video with FFMPEG enabled
@@ -602,10 +859,27 @@ function handleUpload() {
         }
         
         if ($canCreateThumb) {
-            createThumbnail($targetPath, $THUMBS_DIR . '/' . basename($targetPath));
+            // Construct the path for the thumbnail, mirroring the subdirectory structure
+            // $finalTargetSubDirRelative is path like "ui_folder/dropped_folder_subpath"
+            $thumbDestinationDirAbsolute = ensureSecurePath($THUMBS_DIR, $finalTargetSubDirRelative);
+            if($thumbDestinationDirAbsolute === false){
+                 error_log("Failed to create or secure thumbnail subdirectory: " . $THUMBS_DIR . DIRECTORY_SEPARATOR . $finalTargetSubDirRelative);
+            } else {
+                 // The actual thumbnail filename (e.g., image.jpg or video.mp4.jpg)
+                $thumbName = $fileName; // Use the (potentially renamed) filename from $targetPath
+                $fileExtForThumb = strtolower(pathinfo($fileName, PATHINFO_EXTENSION)); // Get ext from final sanitized filename
+
+                if (in_array($fileExtForThumb, $VIDEO_PREVIEW_EXTENSIONS) || ($fileExtForThumb === 'pdf' && $PDF_THUMB_ENABLED && class_exists('Imagick'))) {
+                     $thumbName .= '.jpg';
+                }
+                $thumbFinalPath = $thumbDestinationDirAbsolute . DIRECTORY_SEPARATOR . $thumbName;
+                createThumbnail($targetPath, $thumbFinalPath); 
+            }
         }
         
-        echo json_encode(['success' => true, 'filename' => basename($targetPath)]);
+        // Return the filename and its relative path for UI update if needed
+        $fileLocationForUI = ($finalTargetSubDirRelative ? $finalTargetSubDirRelative . '/' : '') . $fileName;
+        echo json_encode(['success' => true, 'filename' => $fileName, 'path' => $finalTargetSubDirRelative, 'fullPathForUI' => $fileLocationForUI]);
     } else {
         error_log("Failed to move uploaded file: " . $file['name'] . " to " . $targetPath . " - PHP Error: " . $file['error']);
         echo json_encode(['success' => false, 'error' => 'Failed to upload file. Check server logs.']);
@@ -801,52 +1075,71 @@ function handleDelete() {
         return;
     }
     
-    $filename = $_POST['filename'] ?? '';
+    $itemPathInput = $_POST['filename'] ?? ''; // 'filename' POST var now refers to item path (file or dir)
     
-    // SECURITY: Sanitize filename
-    $filename = sanitizeFilename($filename);
-    if (empty($filename)) {
-        echo json_encode(['success' => false, 'error' => 'Invalid filename']);
-        return;
-    }
-    
-    $filePath = $FILES_DIR . '/' . $filename;
-    $thumbPath = $THUMBS_DIR . '/' . $filename;
-    
-    // For video or PDF files, the thumbnail will have a .jpg extension
-    $fileExt = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
-    global $VIDEO_PREVIEW_EXTENSIONS, $PDF_THUMB_ENABLED;
-    if (in_array($fileExt, $VIDEO_PREVIEW_EXTENSIONS) || ($fileExt === 'pdf' && $PDF_THUMB_ENABLED && class_exists('Imagick'))) {
-        $thumbPath .= '.jpg';
-    }
-    
-    // SECURITY: Verify file is within allowed directory
-    $realPath = realpath($filePath);
-    $realBasePath = realpath($FILES_DIR);
-
-    // Check if $realPath is false (file doesn't exist or other error)
-    // or if $realPath does not start with $realBasePath (path traversal attempt)
-    if ($realPath === false || strpos($realPath, $realBasePath . DIRECTORY_SEPARATOR) !== 0 && $realPath !== $realBasePath) {
-        // Allow deletion if the file is exactly $realBasePath (though unlikely for a file)
-        if ($realPath !== $realBasePath . DIRECTORY_SEPARATOR . $filename) {
-             error_log("Path traversal attempt or invalid file path for deletion: User tried to delete '$filename', resolved to '$realPath', base path '$realBasePath'");
-            echo json_encode(['success' => false, 'error' => 'Invalid file path']);
-            return;
+    // Sanitize the itemPathInput (which is relative to $FILES_DIR)
+    $baseFilesDirReal = realpath($FILES_DIR);
+    $sanitizedItemRelativePath = '';
+    if ($itemPathInput !== '') {
+        $normalizedItemPath = trim(str_replace('\\', '/', $itemPathInput), '/');
+        if (strpos($normalizedItemPath, '..') === false) {
+            $prospectiveItemPath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $normalizedItemPath;
+            // realpath checks if the path actually exists. For deletion, it must exist.
+            if (realpath($prospectiveItemPath) !== false && strpos(realpath($prospectiveItemPath), $baseFilesDirReal) === 0) {
+                $sanitizedItemRelativePath = $normalizedItemPath;
+            }
         }
     }
-    
-    if (file_exists($filePath) && is_file($filePath)) {
-        if (unlink($filePath)) {
-            if (file_exists($thumbPath) && is_file($thumbPath)) { // Ensure thumb is also a file
-                unlink($thumbPath);
+
+    if (empty($sanitizedItemRelativePath)) {
+        echo json_encode(['success' => false, 'error' => 'Invalid item path for deletion.']);
+        return;
+    }
+
+    $fullItemPathOnServer = $baseFilesDirReal . DIRECTORY_SEPARATOR . $sanitizedItemRelativePath;
+
+    // SECURITY: Double check it's not the root $FILES_DIR itself
+    if ($fullItemPathOnServer === $baseFilesDirReal) {
+        echo json_encode(['success' => false, 'error' => 'Cannot delete root directory.']);
+        return;
+    }
+
+    if (!file_exists($fullItemPathOnServer)) {
+        echo json_encode(['success' => false, 'error' => 'Item not found.']);
+        return;
+    }
+
+    if (is_dir($fullItemPathOnServer)) {
+        // It's a directory, delete recursively
+        if (deleteDirectoryRecursive($fullItemPathOnServer)) {
+            // Also attempt to delete corresponding thumbs directory
+            $thumbDirToDelete = $THUMBS_DIR . DIRECTORY_SEPARATOR . $sanitizedItemRelativePath;
+            if (is_dir($thumbDirToDelete)) {
+                deleteDirectoryRecursive($thumbDirToDelete); // Ignores failure for thumbs, main deletion succeeded
             }
             echo json_encode(['success' => true]);
         } else {
-             error_log("Failed to delete file: $filePath");
-            echo json_encode(['success' => false, 'error' => 'Failed to delete file']);
+            error_log("Failed to delete directory recursively: " . $fullItemPathOnServer);
+            echo json_encode(['success' => false, 'error' => 'Failed to delete directory.']);
         }
     } else {
-        echo json_encode(['success' => false, 'error' => 'File not found']);
+        // It's a file, delete as before
+        if (@unlink($fullItemPathOnServer)) {
+            // Delete corresponding thumbnail if it exists
+            $thumbPath = $THUMBS_DIR . DIRECTORY_SEPARATOR . $sanitizedItemRelativePath;
+            $fileExt = strtolower(pathinfo($sanitizedItemRelativePath, PATHINFO_EXTENSION));
+            global $VIDEO_PREVIEW_EXTENSIONS, $PDF_THUMB_ENABLED; // Ensure these are accessible
+            if (in_array($fileExt, $VIDEO_PREVIEW_EXTENSIONS) || ($fileExt === 'pdf' && $PDF_THUMB_ENABLED && class_exists('Imagick'))) {
+                $thumbPath .= '.jpg';
+            }
+            if (file_exists($thumbPath) && is_file($thumbPath)) {
+                @unlink($thumbPath);
+            }
+            echo json_encode(['success' => true]);
+        } else {
+            error_log("Failed to delete file: " . $fullItemPathOnServer);
+            echo json_encode(['success' => false, 'error' => 'Failed to delete file.']);
+        }
     }
 }
 
@@ -854,40 +1147,82 @@ function handleDelete() {
 function handleList() {
     global $FILES_DIR, $THUMBS_DIR, $TEXT_PREVIEW_EXTENSIONS, $VIDEO_PREVIEW_EXTENSIONS, $AUDIO_PREVIEW_EXTENSIONS, $PDF_THUMB_ENABLED;
     
-    // Default sort
     $sortBy = $_POST['sortBy'] ?? 'date';
     $sortOrder = $_POST['sortOrder'] ?? 'desc';
+    $currentPathInput = $_POST['currentPath'] ?? '';
+
+    // --- Revised Path Sanitization ---
+    $baseFilesDirReal = realpath($FILES_DIR);
+    if ($baseFilesDirReal === false) {
+        error_log("Critical: FILES_DIR '$FILES_DIR' is not a valid path.");
+        echo json_encode(['success' => false, 'error' => 'Server configuration error.', 'files' => [], 'currentPath' => '']);
+        return;
+    }
+
+    $normalizedPathInput = trim(str_replace('\\', '/', $currentPathInput), '/');
+    $clientSidePath = ''; // Path to send back to client, relative to $FILES_DIR
+    $currentDirForScandir = $baseFilesDirReal; // Actual path to scan on server
+
+    if ($normalizedPathInput !== '' && strpos($normalizedPathInput, '..') === false) {
+        $prospectivePath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $normalizedPathInput;
+        $currentScannablePathReal = realpath($prospectivePath);
+
+        if ($currentScannablePathReal !== false && strpos($currentScannablePathReal, $baseFilesDirReal) === 0) {
+            $currentDirForScandir = $currentScannablePathReal;
+            $clientSidePath = $normalizedPathInput;
+        }
+        // If path is invalid or outside base, $currentDirForScandir remains $baseFilesDirReal and $clientSidePath remains '' (root)
+    } else if (strpos($normalizedPathInput, '..') !== false) {
+        // Path contained '..', force to root. $currentDirForScandir and $clientSidePath already set to root defaults.
+        error_log("Path traversal attempt blocked for input: " . $currentPathInput);
+    }
+    // --- End Revised Path Sanitization ---
 
     $files = [];
-    if (is_dir($FILES_DIR)) {
-        $items = scandir($FILES_DIR);
+    if (is_dir($currentDirForScandir)) {
+        $items = scandir($currentDirForScandir);
         foreach ($items as $item) {
-            if ($item != '.' && $item != '..' && $item != 'thumbs' && $item != '.htaccess' && $item != 'index.html' && is_file($FILES_DIR . '/' . $item)) {
-                $filePath = $FILES_DIR . '/' . $item;
-                $ext = strtolower(pathinfo($item, PATHINFO_EXTENSION));
-                
-                $fileInfo = [
-                    'name' => $item,
-                    'size' => filesize($filePath),
-                    'modified' => filemtime($filePath),
-                    'type' => mime_content_type($filePath),
-                    'extension' => $ext,
-                    // 'hasThumb' => file_exists($THUMBS_DIR . '/' . $item), // Old logic
-                    'canPreview' => false,
-                    'previewType' => null
-                ];
+            if ($item == '.' || $item == '..' || $item == 'thumbs' || $item == '.htaccess' || $item == 'index.html') {
+                continue;
+            }
 
-                // Determine if a thumbnail exists (image or video.jpg)
-                $thumbPathForCheck = $THUMBS_DIR . '/' . $item;
+            $itemPath = $currentDirForScandir . DIRECTORY_SEPARATOR . $item;
+            $isDir = is_dir($itemPath);
+            $ext = $isDir ? '' : strtolower(pathinfo($item, PATHINFO_EXTENSION));
+            
+            $itemSize = 0;
+            if ($isDir) {
+                $itemSize = getDirectorySize($itemPath);
+            } else {
+                $itemSize = filesize($itemPath);
+            }
+
+            $fileInfo = [
+                'name' => $item,
+                'isDirectory' => $isDir,
+                'size' => $itemSize,
+                'modified' => filemtime($itemPath),
+                'type' => $isDir ? 'directory' : mime_content_type($itemPath),
+                'extension' => $ext,
+                'canPreview' => false,
+                'previewType' => null
+            ];
+
+            if ($isDir) {
+                $fileInfo['previewType'] = 'folder';
+                $fileInfo['hasThumb'] = false; 
+            } else {
+                $thumbSubPath = $clientSidePath ? $clientSidePath . DIRECTORY_SEPARATOR . $item : $item;
+                $thumbPathForCheck = $THUMBS_DIR . DIRECTORY_SEPARATOR . $thumbSubPath;
+
                 if (in_array($ext, $VIDEO_PREVIEW_EXTENSIONS)) {
-                    $thumbPathForCheck .= '.jpg'; // Video thumbs are video.mp4.jpg
+                    $thumbPathForCheck .= '.jpg';
                 } elseif ($ext === 'pdf' && $PDF_THUMB_ENABLED && class_exists('Imagick')) {
-                    $thumbPathForCheck .= '.jpg'; // PDF thumbs are document.pdf.jpg
+                    $thumbPathForCheck .= '.jpg';
                 }
                 $fileInfo['hasThumb'] = file_exists($thumbPathForCheck);
                 
-                // Determine preview capability
-                if ($ext === 'pdf') { // PDFs are always previewable as PDF, even with a thumb
+                if ($ext === 'pdf') { 
                     $fileInfo['canPreview'] = true;
                     $fileInfo['previewType'] = 'pdf';
                 } elseif ($fileInfo['hasThumb']) {
@@ -895,13 +1230,12 @@ function handleList() {
                     if (in_array($ext, $VIDEO_PREVIEW_EXTENSIONS)) {
                         $fileInfo['previewType'] = 'video';
                     } else {
-                        // Assume image if it has a thumb and is not a video (covers jpg, png, etc.)
                         $fileInfo['previewType'] = 'image';
                     }
                 } elseif (in_array($ext, $TEXT_PREVIEW_EXTENSIONS)) {
                     $fileInfo['canPreview'] = true;
                     $fileInfo['previewType'] = 'text';
-                } elseif (in_array($ext, $VIDEO_PREVIEW_EXTENSIONS)) { // For videos that might not have a thumb
+                } elseif (in_array($ext, $VIDEO_PREVIEW_EXTENSIONS)) { 
                     $fileInfo['canPreview'] = true;
                     $fileInfo['previewType'] = 'video';
                 } elseif (in_array($ext, $AUDIO_PREVIEW_EXTENSIONS)) {
@@ -911,13 +1245,18 @@ function handleList() {
                     $fileInfo['canPreview'] = true;
                     $fileInfo['previewType'] = 'zip';
                 }
-                
-                $files[] = $fileInfo;
             }
+            
+            $files[] = $fileInfo;
         }
 
-        // Sort files
         usort($files, function($a, $b) use ($sortBy, $sortOrder) {
+            if ($a['isDirectory'] && !$b['isDirectory']) {
+                return -1;
+            } elseif (!$a['isDirectory'] && $b['isDirectory']) {
+                return 1;
+            }
+
             $modifier = ($sortOrder === 'asc') ? 1 : -1;
             switch ($sortBy) {
                 case 'name':
@@ -931,51 +1270,58 @@ function handleList() {
         });
     }
     
-    echo json_encode(['success' => true, 'files' => $files]);
+    echo json_encode(['success' => true, 'files' => $files, 'currentPath' => $clientSidePath]);
+}
+
+// Function to recursively calculate directory size
+function getDirectorySize($dir) {
+    $size = 0;
+    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)) as $file) {
+        if ($file->isFile()) {
+            $size += $file->getSize();
+        }
+    }
+    return $size;
 }
 
 // Function to handle text file preview
 function handleTextPreview() {
     global $FILES_DIR, $TEXT_PREVIEW_EXTENSIONS;
     
-    $filename = $_POST['filename'] ?? '';
-    
-    // SECURITY: Sanitize filename
-    $filename = sanitizeFilename($filename);
-    if (empty($filename)) {
-        echo json_encode(['success' => false, 'error' => 'Invalid filename']);
-        return;
-    }
-    
-    $filePath = $FILES_DIR . '/' . $filename;
-    
-    // SECURITY: Verify file is within allowed directory
-    $realPath = realpath($filePath);
-    $realBasePath = realpath($FILES_DIR);
-    if ($realPath === false || strpos($realPath, $realBasePath . DIRECTORY_SEPARATOR) !== 0 && $realPath !== $realBasePath) {
-         if ($realPath !== $realBasePath . DIRECTORY_SEPARATOR . $filename) {
-            error_log("Path traversal attempt or invalid file path for text preview: User tried '$filename', resolved to '$realPath', base path '$realBasePath'");
-            echo json_encode(['success' => false, 'error' => 'Invalid file path']);
-            return;
+    $filePathInput = $_POST['filename'] ?? ''; // Input is a relative path
+
+    // Sanitize the filePathInput
+    $baseFilesDirReal = realpath($FILES_DIR);
+    $sanitizedRelativePath = '';
+    if ($filePathInput !== '' && $baseFilesDirReal !== false) {
+        $normalizedPath = trim(str_replace('\\', '/', $filePathInput), '/');
+        if (strpos($normalizedPath, '..') === false) {
+            $prospectiveFullPath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $normalizedPath;
+            $realProspectivePath = realpath($prospectiveFullPath);
+            if ($realProspectivePath !== false && strpos($realProspectivePath, $baseFilesDirReal) === 0 && is_file($realProspectivePath)) {
+                $sanitizedRelativePath = $normalizedPath;
+            }
         }
     }
-    
-    // Check if file exists and is a text file
-    if (!file_exists($filePath) || !is_file($filePath)) {
-        echo json_encode(['success' => false, 'error' => 'File not found']);
+
+    if (empty($sanitizedRelativePath)) {
+        error_log("handleTextPreview: Invalid or non-existent file path. Input: " . $filePathInput);
+        echo json_encode(['success' => false, 'error' => 'Invalid file path for text preview']);
         return;
     }
+
+    $fullFilePathOnServer = $baseFilesDirReal . DIRECTORY_SEPARATOR . $sanitizedRelativePath;
     
-    $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    $ext = strtolower(pathinfo($sanitizedRelativePath, PATHINFO_EXTENSION));
     if (!in_array($ext, $TEXT_PREVIEW_EXTENSIONS)) {
-        echo json_encode(['success' => false, 'error' => 'File type not supported for preview']);
+        echo json_encode(['success' => false, 'error' => 'File type not supported for text preview']);
         return;
     }
     
     // Read file content (limit to 1MB for preview)
-    $content = file_get_contents($filePath, false, null, 0, 1024 * 1024);
+    $content = file_get_contents($fullFilePathOnServer, false, null, 0, 1024 * 1024);
     if ($content === false) {
-        echo json_encode(['success' => false, 'error' => 'Failed to read file']);
+        echo json_encode(['success' => false, 'error' => 'Failed to read file for text preview']);
         return;
     }
     
@@ -994,7 +1340,7 @@ function handleTextPreview() {
         'success' => true,
         'content' => $content,
         'extension' => $ext,
-        'truncated' => filesize($filePath) > 1024 * 1024
+        'truncated' => filesize($fullFilePathOnServer) > 1024 * 1024
     ]);
 }
 
@@ -1002,32 +1348,29 @@ function handleTextPreview() {
 function handleZipContents() {
     global $FILES_DIR;
     
-    $filename = $_POST['filename'] ?? '';
-    
-    // SECURITY: Sanitize filename
-    $filename = sanitizeFilename($filename);
-    if (empty($filename)) {
-        echo json_encode(['success' => false, 'error' => 'Invalid filename']);
-        return;
-    }
-    
-    $filePath = $FILES_DIR . '/' . $filename;
-    
-    // SECURITY: Verify file is within allowed directory
-    $realPath = realpath($filePath);
-    $realBasePath = realpath($FILES_DIR);
-     if ($realPath === false || strpos($realPath, $realBasePath . DIRECTORY_SEPARATOR) !== 0 && $realPath !== $realBasePath) {
-         if ($realPath !== $realBasePath . DIRECTORY_SEPARATOR . $filename) {
-            error_log("Path traversal attempt or invalid file path for ZIP preview: User tried '$filename', resolved to '$realPath', base path '$realBasePath'");
-            echo json_encode(['success' => false, 'error' => 'Invalid file path']);
-            return;
+    $filePathInput = $_POST['filename'] ?? ''; // Input is a relative path
+
+    // Sanitize the filePathInput
+    $baseFilesDirReal = realpath($FILES_DIR);
+    $sanitizedRelativePath = '';
+    if ($filePathInput !== '' && $baseFilesDirReal !== false) {
+        $normalizedPath = trim(str_replace('\\', '/', $filePathInput), '/');
+        if (strpos($normalizedPath, '..') === false) {
+            $prospectiveFullPath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $normalizedPath;
+            $realProspectivePath = realpath($prospectiveFullPath);
+            if ($realProspectivePath !== false && strpos($realProspectivePath, $baseFilesDirReal) === 0 && is_file($realProspectivePath)) {
+                $sanitizedRelativePath = $normalizedPath;
+            }
         }
     }
-    
-    if (!file_exists($filePath) || !is_file($filePath)) {
-        echo json_encode(['success' => false, 'error' => 'File not found']);
+
+    if (empty($sanitizedRelativePath)) {
+        error_log("handleZipContents: Invalid or non-existent file path. Input: " . $filePathInput);
+        echo json_encode(['success' => false, 'error' => 'Invalid file path for ZIP preview']);
         return;
     }
+
+    $fullFilePathOnServer = $baseFilesDirReal . DIRECTORY_SEPARATOR . $sanitizedRelativePath;
     
     if (!class_exists('ZipArchive')) {
         echo json_encode(['success' => false, 'error' => 'ZipArchive class not found. Please install the PHP Zip extension.']);
@@ -1035,7 +1378,7 @@ function handleZipContents() {
     }
 
     $zip = new ZipArchive();
-    if ($zip->open($filePath) === TRUE) {
+    if ($zip->open($fullFilePathOnServer) === TRUE) {
         $contents = [];
         $totalUncompressed = 0;
         $maxZipEntries = 1000; // Limit number of entries to show
@@ -1173,57 +1516,56 @@ function downloadAll() {
 
 
 // Function to download single file
-function downloadSingle($filename) {
+function downloadSingle($filePathInput) { // Parameter is now the relative path from FILES_DIR root
     global $FILES_DIR;
     
-    // SECURITY: Sanitize filename
-    $unsafeFilename = $filename; // Keep original for logging
-    $filename = sanitizeFilename($filename);
+    // Sanitize the filePathInput to prevent path traversal but allow subdirectories
+    $baseFilesDirReal = realpath($FILES_DIR);
+    $sanitizedRelativePath = '';
 
-    if (empty($filename)) {
-        error_log("DownloadSingle: Empty filename after sanitization. Original: '$unsafeFilename'");
+    if ($filePathInput !== '') {
+        // Normalize slashes and remove leading/trailing slashes for the input
+        $normalizedPath = trim(str_replace('\\', '/', $filePathInput), '/');
+        // Disallow '..' components
+        if (strpos($normalizedPath, '..') === false) {
+            // Construct the prospective full path
+            $prospectiveFullPath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $normalizedPath;
+            $realProspectivePath = realpath($prospectiveFullPath); // Check if it resolves to an actual file/dir
+
+            // Ensure the resolved path is within $FILES_DIR and is a file
+            if ($realProspectivePath !== false && strpos($realProspectivePath, $baseFilesDirReal) === 0 && is_file($realProspectivePath)) {
+                $sanitizedRelativePath = $normalizedPath;
+            }
+        }
+    }
+
+    if (empty($sanitizedRelativePath)) {
+        error_log("DownloadSingle: Invalid or non-existent file path after sanitization. Original input: '" . $filePathInput . "'");
         header('HTTP/1.0 400 Bad Request');
-        echo 'Invalid filename';
+        echo 'Invalid filename or path.';
         return;
     }
     
-    $filePath = $FILES_DIR . '/' . $filename;
+    $fullFilePathOnServer = $baseFilesDirReal . DIRECTORY_SEPARATOR . $sanitizedRelativePath;
+    // Redundant check as realpath above would have failed, but good for clarity
+    // if (!file_exists($fullFilePathOnServer) || !is_file($fullFilePathOnServer)) { ... }
     
-    // SECURITY: Verify file is within allowed directory
-    $realPath = realpath($filePath);
-    $realBasePath = realpath($FILES_DIR);
+    // SECURITY: Rate limit downloads
+    rateLimit('download');
+    
+    header('Content-Type: application/octet-stream');
+    header('Content-Disposition: attachment; filename="' . basename($sanitizedRelativePath) . '"'); // Use basename of the relative path for download filename
+    header('Content-Length: ' . filesize($fullFilePathOnServer));
+    header('Cache-Control: no-cache, must-revalidate, post-check=0, pre-check=0');
+    header('Pragma: public');
+    header('Expires: 0');
 
-    if ($realPath === false || strpos($realPath, $realBasePath . DIRECTORY_SEPARATOR) !== 0 && $realPath !== $realBasePath) {
-         if ($realPath !== $realBasePath . DIRECTORY_SEPARATOR . $filename) {
-            error_log("Path traversal attempt or invalid file path for single download: User tried '$unsafeFilename', sanitized to '$filename', resolved to '$realPath', base path '$realBasePath'");
-            header('HTTP/1.0 403 Forbidden');
-            echo 'Access denied';
-            return;
-        }
+    if (ob_get_level()) { 
+       ob_end_clean();
     }
     
-    if (file_exists($filePath) && is_file($filePath)) {
-        // SECURITY: Rate limit downloads
-        rateLimit('download');
-        
-        header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="' . basename($filename) . '"'); // basename() for good measure
-        header('Content-Length: ' . filesize($filePath));
-        header('Cache-Control: no-cache, must-revalidate, post-check=0, pre-check=0');
-        header('Pragma: public');
-        header('Expires: 0'); // Expire immediately
-
-        if (ob_get_level()) { // Clean any output buffers
-           ob_end_clean();
-        }
-        
-        readfile($filePath);
-        exit; // Ensure script termination after file send
-    } else {
-        error_log("DownloadSingle: File not found or not a file: $filePath (Original: '$unsafeFilename')");
-        header('HTTP/1.0 404 Not Found');
-        echo 'File not found';
-    }
+    readfile($fullFilePathOnServer);
+    exit; 
 }
 
 // New function to handle storage usage request
@@ -1369,6 +1711,344 @@ function handleDownloadSelectedZip() {
         if (file_exists($zipPath)) unlink($zipPath);
         http_response_code(500);
         die('Error: Could not create archive. Check server logs.');
+    }
+}
+
+// Handle folder download as ZIP
+if (isset($_GET['download_folder'])) {
+    if (!$PASSWORD_PROTECTION || isset($_SESSION['authenticated'])) {
+        $folderPathRelative = $_GET['download_folder'];
+        
+        // Basic sanitization: prevent .. and ensure it's not empty after sanitization.
+        // Normalize slashes first, then trim, then check for ..
+        $normalizedPath = str_replace('\\', '/', $folderPathRelative);
+        $normalizedPath = trim($normalizedPath, '/');
+        
+        if (empty($normalizedPath) || strpos($normalizedPath, '..') !== false) {
+            http_response_code(400);
+            error_log("Attempt to download folder with invalid path: " . $folderPathRelative);
+            die('Invalid folder path specified.');
+        }
+        $zipName = basename($normalizedPath) . '.zip';
+        downloadDirectoryAsZip($normalizedPath, $zipName);
+    } else {
+        http_response_code(403);
+        die('Authentication required.');
+    }
+    exit;
+}
+
+// Recursive function to add files and subdirectories to a ZIP file
+function addFolderToZip($folderPath, $zipArchive, $basePathInZip, &$totalOriginalFileSize) {
+    global $FILES_DIR, $MAX_ZIP_EXTRACTION_SIZE; // Access global for limits
+
+    $items = @scandir($folderPath);
+    if ($items === false) {
+        error_log("addFolderToZip: Failed to scan directory: " . $folderPath);
+        return; // Or handle error, maybe throw exception
+    }
+
+    foreach ($items as $item) {
+        if ($item == '.' || $item == '..') {
+            continue;
+        }
+        $itemFullPath = $folderPath . DIRECTORY_SEPARATOR . $item;
+        $itemPathInZip = $basePathInZip . $item;
+
+        if (is_dir($itemFullPath)) {
+            $zipArchive->addEmptyDir($itemPathInZip);
+            addFolderToZip($itemFullPath, $zipArchive, $itemPathInZip . '/', $totalOriginalFileSize);
+        } elseif (is_file($itemFullPath)) {
+            $fileSize = filesize($itemFullPath);
+            if ($MAX_ZIP_EXTRACTION_SIZE > 0 && ($totalOriginalFileSize + $fileSize > $MAX_ZIP_EXTRACTION_SIZE)) {
+                error_log("addFolderToZip: Estimated extraction size limit exceeded. File: $itemPathInZip, Size: $fileSize, Total: $totalOriginalFileSize");
+                throw new Exception('Archive content would exceed maximum allowed extraction size.');
+            }
+            if ($zipArchive->addFile($itemFullPath, $itemPathInZip)) {
+                $totalOriginalFileSize += $fileSize;
+            } else {
+                error_log("addFolderToZip: Failed to add file to zip: $itemFullPath as $itemPathInZip");
+                // Optionally throw an exception or handle error
+            }
+        }
+    }
+}
+
+// Function to download a specific directory as ZIP
+function downloadDirectoryAsZip($folderPathRelative, $zipName) {
+    global $FILES_DIR, $MAX_ZIP_SIZE, $MAX_ZIP_EXTRACTION_SIZE; 
+
+    rateLimit('download_folder'); 
+
+    $baseFilesDirReal = realpath($FILES_DIR);
+    if ($baseFilesDirReal === false) { // Should not happen if FILES_DIR is valid
+        error_log("downloadDirectoryAsZip: Invalid FILES_DIR configuration.");
+        http_response_code(500);
+        die('Server configuration error.');
+    }
+    
+    $fullFolderPath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $folderPathRelative;
+    $fullFolderPathReal = realpath($fullFolderPath);
+
+    if ($fullFolderPathReal === false || strpos($fullFolderPathReal, $baseFilesDirReal) !== 0 || !is_dir($fullFolderPathReal) || $fullFolderPathReal === $baseFilesDirReal) {
+        error_log("downloadDirectoryAsZip: Invalid or non-directory path specified: " . $folderPathRelative . " (Resolved: " . $fullFolderPathReal . ")");
+        http_response_code(404);
+        die('Folder not found or access denied.');
+    }
+
+    if (!class_exists('ZipArchive')) {
+        error_log("ZipArchive class not found for downloadDirectoryAsZip. Please install the PHP Zip extension.");
+        http_response_code(500);
+        die('Server error: ZIP functionality not available.');
+    }
+
+    $zip = new ZipArchive();
+    $tempZipDir = sys_get_temp_dir();
+    $zipPath = tempnam($tempZipDir, 'sfd_folder_zip_');
+    if ($zipPath === false) {
+        error_log("Failed to create temporary file for folder zip in $tempZipDir");
+        http_response_code(500);
+        die('Server error: Could not create temporary zip file.');
+    }
+    unlink($zipPath); 
+    $zipPath .= '.zip';
+
+    if ($zip->open($zipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) === TRUE) {
+        $totalOriginalFileSize = 0; 
+        try {
+            addFolderToZip($fullFolderPathReal, $zip, '', $totalOriginalFileSize);
+        } catch (Exception $e) {
+            $zip->close();
+            unlink($zipPath);
+            error_log("downloadDirectoryAsZip: Exception during zipping - " . $e->getMessage());
+            http_response_code(413); 
+            die('Error: ' . $e->getMessage());
+        }
+
+        $zip->close();
+
+        if ($MAX_ZIP_SIZE > 0 && filesize($zipPath) > $MAX_ZIP_SIZE) {
+            unlink($zipPath);
+            error_log("downloadDirectoryAsZip: Final zip file size exceeded MAX_ZIP_SIZE. Size: " . filesize($zipPath));
+            http_response_code(413);
+            die('Error: Archive size limit exceeded.');
+        }
+
+        header('Content-Type: application/zip');
+        header('Content-Disposition: attachment; filename="' . sanitizeFilename($zipName) . '"');
+        header('Content-Length: ' . filesize($zipPath));
+        header('Cache-Control: no-cache, must-revalidate');
+        header('Pragma: public');
+        if (ob_get_level()) ob_end_clean();
+        readfile($zipPath);
+        unlink($zipPath);
+        exit;
+    } else {
+        error_log("downloadDirectoryAsZip: Failed to open temporary zip file for writing: $zipPath. ZipArchive status: " . $zip->status);
+        if (file_exists($zipPath)) unlink($zipPath);
+        http_response_code(500);
+        die('Error: Could not create archive. Check server logs.');
+    }
+}
+
+// Function to handle creating a new folder
+function handleCreateFolder() {
+    global $FILES_DIR;
+
+    $folderNameInput = $_POST['folderName'] ?? '';
+    $currentPathInput = $_POST['currentPath'] ?? '';
+
+    // 1. Sanitize folderNameInput: allow only valid filename characters, no slashes or traversal.
+    // Use a simplified version of sanitizeFilename, focusing on the name part.
+    $sanitizedFolderName = preg_replace('/[^a-zA-Z0-9_\- ]/', '_', $folderNameInput); // Allow spaces, replace others with underscore
+    $sanitizedFolderName = preg_replace('/_+/', '_', $sanitizedFolderName); // Consolidate underscores
+    $sanitizedFolderName = trim($sanitizedFolderName, '_');
+    if (empty($sanitizedFolderName) || $sanitizedFolderName === '.' || $sanitizedFolderName === '..') {
+        echo json_encode(['success' => false, 'error' => 'Invalid folder name provided.']);
+        return;
+    }
+    if (strlen($sanitizedFolderName) > 200) { // Arbitrary length limit for folder names
+        $sanitizedFolderName = substr($sanitizedFolderName, 0, 200);
+    }
+
+    // 2. Sanitize currentPathInput (path active in UI)
+    $baseFilesDirReal = realpath($FILES_DIR);
+    if ($baseFilesDirReal === false) {
+        echo json_encode(['success' => false, 'error' => 'Server configuration error: Invalid base files directory.']); return;
+    }
+    $sanitizedUiPathRelative = ''; // Relative to $FILES_DIR
+    if ($currentPathInput !== '') {
+        $normalizedUiPath = trim(str_replace('\\', '/', $currentPathInput), '/');
+        if (strpos($normalizedUiPath, '..') === false) {
+            $prospectiveUiPath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $normalizedUiPath;
+            if (realpath($prospectiveUiPath) !== false && strpos(realpath($prospectiveUiPath), $baseFilesDirReal) === 0 && is_dir(realpath($prospectiveUiPath))) {
+                $sanitizedUiPathRelative = $normalizedUiPath;
+            }
+        } // If path is bad, it defaults to root ($sanitizedUiPathRelative remains '')
+    }
+
+    // 3. Construct the full path for the new folder
+    $newFolderPath = $baseFilesDirReal . 
+                       ($sanitizedUiPathRelative ? DIRECTORY_SEPARATOR . $sanitizedUiPathRelative : '') .
+                       DIRECTORY_SEPARATOR . $sanitizedFolderName;
+
+    // 4. Check if a file or folder with that name already exists
+    if (file_exists($newFolderPath)) {
+        echo json_encode(['success' => false, 'error' => 'A file or folder with this name already exists.']);
+        return;
+    }
+
+    // 5. Create the new directory
+    if (@mkdir($newFolderPath, 0755)) { // No need for recursive, creating one level
+        // 6. Secure the new folder
+        createHtaccessInDirectory($newFolderPath);
+        createIndexHtmlInDirectory($newFolderPath);
+        echo json_encode(['success' => true]);
+    } else {
+        error_log("Failed to create directory: " . $newFolderPath);
+        echo json_encode(['success' => false, 'error' => 'Could not create the folder on the server.']);
+    }
+}
+
+// *** NEW FUNCTION: handleRename ***
+function handleRename() {
+    global $FILES_DIR, $THUMBS_DIR, $VIDEO_PREVIEW_EXTENSIONS, $PDF_THUMB_ENABLED;
+
+    $itemIdentifier = $_POST['itemIdentifier'] ?? ''; // Full relative path from FILES_DIR root
+    $newNameRaw = $_POST['newName'] ?? '';
+
+    // 1. Validate and sanitize itemIdentifier (current path)
+    $baseFilesDirReal = realpath($FILES_DIR);
+    if ($baseFilesDirReal === false) {
+        echo json_encode(['success' => false, 'error' => 'Server configuration error: Invalid base files directory.']); return;
+    }
+
+    $currentItemRelativePath = '';
+    if ($itemIdentifier !== '') {
+        $normalizedItemPath = trim(str_replace('\\\\', '/', $itemIdentifier), '/');
+        if (strpos($normalizedItemPath, '..') === false) {
+            $prospectiveItemPath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $normalizedItemPath;
+            if (realpath($prospectiveItemPath) !== false && strpos(realpath($prospectiveItemPath), $baseFilesDirReal) === 0) {
+                $currentItemRelativePath = $normalizedItemPath;
+            }
+        }
+    }
+
+    if (empty($currentItemRelativePath)) {
+        echo json_encode(['success' => false, 'error' => 'Invalid current item path.']);
+        return;
+    }
+
+    $oldFullPath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $currentItemRelativePath;
+    if (!file_exists($oldFullPath)) {
+        echo json_encode(['success' => false, 'error' => 'Item to rename not found.']);
+        return;
+    }
+
+    // 2. Sanitize newNameRaw
+    if (empty(trim($newNameRaw))) {
+        echo json_encode(['success' => false, 'error' => 'New name cannot be empty.']);
+        return;
+    }
+
+    $isDir = is_dir($oldFullPath);
+    $finalNewName = '';
+    $originalNamePartForNew = pathinfo($newNameRaw, PATHINFO_FILENAME);
+    $originalExtensionForNew = strtolower(pathinfo($newNameRaw, PATHINFO_EXTENSION));
+
+    if ($isDir) {
+        // For directories, sanitize the whole newNameRaw as a folder name
+        // Use a simplified sanitization, similar to create_folder
+        $sanitizedNewFolderName = preg_replace('/[^a-zA-Z0-9 _\\-.()[\\]\\,]/', '_', $newNameRaw);
+        $sanitizedNewFolderName = preg_replace('/[_\\s]+/', '_', $sanitizedNewFolderName);
+        $sanitizedNewFolderName = trim($sanitizedNewFolderName, '_');
+        if (empty($sanitizedNewFolderName) || $sanitizedNewFolderName === '.' || $sanitizedNewFolderName === '..') {
+            echo json_encode(['success' => false, 'error' => 'Invalid new folder name after sanitization.']);
+            return;
+        }
+        if (strlen($sanitizedNewFolderName) > 200) {
+            $sanitizedNewFolderName = substr($sanitizedNewFolderName, 0, 200);
+        }
+        $finalNewName = $sanitizedNewFolderName;
+    } else {
+        // For files, sanitize the name part, keep original extension from $newNameRaw
+        $sanitizedNewNamePart = sanitizeFilename($originalNamePartForNew . (empty($originalExtensionForNew) ? '' : '.dummy')); // Use sanitizeFilename for the name part
+        $finalNewName = pathinfo($sanitizedNewNamePart, PATHINFO_FILENAME); // Get the sanitized name part
+
+        if (!empty($originalExtensionForNew)) {
+            $finalNewName .= '.' . $originalExtensionForNew; // Re-attach original extension from newName
+        } else {
+            // If new name has no extension, try to use original file's extension
+             $originalFileExtension = strtolower(pathinfo($currentItemRelativePath, PATHINFO_EXTENSION));
+             if (!empty($originalFileExtension)) {
+                 $finalNewName .= '.' . $originalFileExtension;
+             }
+        }
+    }
+    
+    if (empty($finalNewName)) {
+        echo json_encode(['success' => false, 'error' => 'New name became empty after sanitization.']);
+        return;
+    }
+
+    // 3. Construct new path and check for conflicts
+    $parentDirRelativePath = dirname($currentItemRelativePath);
+    if ($parentDirRelativePath === '.') $parentDirRelativePath = ''; // Handle root directory
+
+    $newRelativePath = ($parentDirRelativePath ? $parentDirRelativePath . '/' : '') . $finalNewName;
+    $newFullPath = $baseFilesDirReal . DIRECTORY_SEPARATOR . $newRelativePath;
+
+    if ($oldFullPath === $newFullPath) {
+        echo json_encode(['success' => true, 'message' => 'No change in name.']); // Technically success, no operation needed.
+        return;
+    }
+
+    if (file_exists($newFullPath)) {
+        echo json_encode(['success' => false, 'error' => 'An item with the new name already exists in this location.']);
+        return;
+    }
+
+    // 4. Perform rename
+    if (rename($oldFullPath, $newFullPath)) {
+        // 5. Handle thumbnail rename for files
+        if (!$isDir) {
+            $oldThumbPath = '';
+            $newThumbPath = '';
+
+            $oldFileExt = strtolower(pathinfo($currentItemRelativePath, PATHINFO_EXTENSION));
+            $newFileExt = strtolower(pathinfo($newRelativePath, PATHINFO_EXTENSION)); // Should be same unless ext changed
+
+            // Construct old thumb path
+            $oldThumbNamePart = $currentItemRelativePath;
+            if (in_array($oldFileExt, $VIDEO_PREVIEW_EXTENSIONS) || ($oldFileExt === 'pdf' && $PDF_THUMB_ENABLED && class_exists('Imagick'))) {
+                $oldThumbNamePart .= '.jpg';
+            }
+            $oldThumbPath = realpath($THUMBS_DIR) . DIRECTORY_SEPARATOR . $oldThumbNamePart;
+            
+            // Construct new thumb path
+            $newThumbNamePart = $newRelativePath;
+             if (in_array($newFileExt, $VIDEO_PREVIEW_EXTENSIONS) || ($newFileExt === 'pdf' && $PDF_THUMB_ENABLED && class_exists('Imagick'))) {
+                $newThumbNamePart .= '.jpg';
+            }
+            // Ensure the target directory for the new thumb exists
+            $newThumbDir = dirname(realpath($THUMBS_DIR) . DIRECTORY_SEPARATOR . $newThumbNamePart);
+            if (!is_dir($newThumbDir)) {
+                ensureSecurePath(realpath($THUMBS_DIR), dirname($newRelativePath . ($in_array($newFileExt, $VIDEO_PREVIEW_EXTENSIONS) || ($newFileExt === 'pdf' && $PDF_THUMB_ENABLED && class_exists('Imagick')) ? '.jpg':'')));
+            }
+            $newThumbPath = realpath($THUMBS_DIR) . DIRECTORY_SEPARATOR . $newThumbNamePart;
+
+            if (file_exists($oldThumbPath) && is_file($oldThumbPath) && !empty($newThumbPath)) {
+                // The directory for the new thumb ($newThumbDir) should have been ensured above.
+                if (!rename($oldThumbPath, $newThumbPath)) {
+                     error_log("Failed to rename thumbnail from {$oldThumbPath} to {$newThumbPath}");
+                     // Don't fail the whole operation, but log it.
+                }
+            }
+        }
+        echo json_encode(['success' => true]);
+    } else {
+        error_log("Failed to rename item from {$oldFullPath} to {$newFullPath}");
+        echo json_encode(['success' => false, 'error' => 'Failed to rename the item on the server.']);
     }
 }
 ?>
@@ -2054,15 +2734,15 @@ function handleDownloadSelectedZip() {
         
         .preview-close {
             position: absolute;
-            top: 1rem;
-            right: 1rem;
-            width: 40px;
-            height: 40px;
+            top: 0px;    /* Flush to top for all preview modals */
+            right: 0px;   /* Flush to right for all preview modals */
+            width: 32px; /* Standardized smaller size */
+            height: 32px; /* Standardized smaller size */
             background: rgba(255, 255, 255, 0.1);
             color: white;
             border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 50%;
-            font-size: 1.5rem;
+            border-radius: 0px; /* Sharp square corners for all previews */
+            font-size: 1.2rem; /* Standardized icon size */
             cursor: pointer;
             display: flex;
             align-items: center;
@@ -2071,6 +2751,16 @@ function handleDownloadSelectedZip() {
             z-index: 2010; /* Ensure close button is above content */
         }
         
+        /* REMOVE/Ensure Specific adjustments for lightbox close button are removed if they differ from above */
+        /* #lightbox .preview-close {
+            width: 32px; 
+            height: 32px; 
+            top: 0px;    
+            right: 0px;   
+            font-size: 1.2rem; 
+            border-radius: 0px; 
+        } */
+
         .preview-close:hover {
             background: rgba(255, 255, 255, 0.2);
         }
@@ -2418,6 +3108,21 @@ function handleDownloadSelectedZip() {
                 display: none;
             }
         }
+
+        #breadcrumbNav {
+            padding: 0.5rem 1rem; 
+            background: var(--bg-tertiary); 
+            border-bottom: 1px solid var(--border-color); 
+            border-radius: 5px 5px 0 0; 
+            display: none; /* Initially hidden */
+            margin-bottom: 1rem; /* Added padding below breadcrumbs */
+        }
+
+        [data-theme="dark"] #createFolderBtn {
+            /* color: #ffffff; */ /* Reverting to inherit from .btn-secondary which is already white */
+            /* background-color: #555555; */ /* No longer needed with text plus */
+            /* border-color: #666666; */ /* No longer needed */
+        }
     </style>
 </head>
 <body>
@@ -2481,11 +3186,13 @@ function handleDownloadSelectedZip() {
                 <button class="btn btn-danger" id="deleteSelectedBtn" onclick="deleteSelectedFiles()" style="display: none; margin-right: 0.5rem;">🗑️ Delete Selected</button>
                 <?php endif; ?>
                 <button class="btn btn-secondary" id="downloadSelectedBtn" onclick="downloadSelectedFiles()" style="display: none; margin-right: 0.5rem;">📥 Download Selected</button>
+                <button class="btn btn-secondary" id="createFolderBtn" onclick="handleCreateFolderClick()" title="Create New Folder" style="margin-right: 0.5rem;">+ 📁</button> 
                 <button class="btn" onclick="downloadAll()">📥 Download All</button>
             </div>
         </div>
 
         <div class="files-container">
+            <div id="breadcrumbNav" style="padding: 0.5rem 1rem; background: var(--bg-tertiary); border-bottom: 1px solid var(--border-color); border-radius: 5px 5px 0 0; display: none;"></div>
             <div id="listView" class="list-view active"></div>
             <div id="iconView" class="icon-view"></div>
             <div id="emptyState" class="empty-state" style="display: none;">
@@ -2531,7 +3238,7 @@ function handleDownloadSelectedZip() {
         <button class="preview-close" onclick="closeVideoPlayer(event, false)">×</button>
         <div class="preview-title" id="videoTitle"></div>
         <div class="video-player">
-            <video id="videoPlayer" controls></video>
+            <video id="videoPlayer" controls playsinline webkit-playsinline></video>
         </div>
     </div>
     
@@ -2567,6 +3274,7 @@ function handleDownloadSelectedZip() {
         const allowFileDeletion = <?php echo json_encode($ALLOW_FILE_DELETION); ?>;
         const maxFileSize = <?php echo $MAX_FILE_SIZE; ?>; // Pass MAX_FILE_SIZE to JS
         let isSelectionModeActive = false;
+        let currentDirectoryPath = ''; // Variable to store the current path
         
         // Lightbox zoom/pan state
         let lightboxZoomLevel = 1;
@@ -2684,8 +3392,74 @@ function handleDownloadSelectedZip() {
         
         function handleDrop(e) {
             const dt = e.dataTransfer;
-            const files = dt.files;
-            handleFiles(files);
+            const items = dt.items;
+            const filesToUpload = []; // Temp array to collect all files with their paths
+            let promises = [];
+
+            if (items && items.length) {
+                for (let i = 0; i < items.length; i++) {
+                    const item = items[i].webkitGetAsEntry(); // Try to get as a FileSystemEntry
+                    if (item) {
+                        promises.push(traverseFileTree(item, '', filesToUpload));
+                    }
+                }
+
+                Promise.all(promises).then(() => {
+                    // Now filesToUpload is populated with { file: FileObject, path: "relative/path/to/file.ext" }
+                    uploadQueue.push(...filesToUpload); // Add all collected files to the main queue
+                    processUploadQueue();
+                    document.getElementById('uploadArea').classList.remove('dragover');
+                }).catch(err => {
+                    console.error("Error processing dropped items:", err);
+                    document.getElementById('uploadArea').classList.remove('dragover');
+                });
+            } else {
+                // Fallback for browsers that don't support getAsEntry or if no items found
+                handleFiles(dt.files); 
+                document.getElementById('uploadArea').classList.remove('dragover');
+            }
+        }
+
+        // Recursive function to traverse directories and collect files
+        function traverseFileTree(entry, path, filesToUpload) {
+            return new Promise((resolve, reject) => {
+                if (entry.isFile) {
+                    entry.file(file => {
+                        // Client-side check for file size before adding to queue
+                        if (file.size > maxFileSize) {
+                            alert(`File '${path + file.name}' exceeds the maximum allowed size of ${formatFileSize(maxFileSize)}.`);
+                            resolve(); // Resolve even if skipped, to not break Promise.all
+                            return;
+                        }
+                        filesToUpload.push({ file: file, path: path + file.name });
+                        resolve();
+                    }, err => {
+                        console.error("Could not get file from entry: ", err);
+                        reject(err); 
+                    });
+                } else if (entry.isDirectory) {
+                    let dirReader = entry.createReader();
+                    let allEntries = [];
+                    
+                    const readEntries = () => {
+                        dirReader.readEntries(entries => {
+                            if (!entries.length) {
+                                // All entries read, now process them
+                                Promise.all(allEntries.map(e => traverseFileTree(e, path + entry.name + '/', filesToUpload)))
+                                    .then(resolve)
+                                    .catch(reject);
+                            } else {
+                                allEntries = allEntries.concat(Array.from(entries));
+                                readEntries(); // Read more entries if available
+                            }
+                        }, err => {
+                            console.error("Could not read directory entries: ", err);
+                            reject(err);
+                        });
+                    };
+                    readEntries(); // Start reading directory entries
+                }
+            });
         }
         
         // Setup file input
@@ -2707,7 +3481,8 @@ function handleDownloadSelectedZip() {
                     alert(`File '${file.name}' exceeds the maximum allowed size of ${formatFileSize(maxFileSize)}.`);
                     return; // Skip this file
                 }
-                uploadQueue.push(file);
+                // For files selected via input, path is just the filename (no folder structure)
+                uploadQueue.push({ file: file, path: file.name }); 
             });
             processUploadQueue();
         }
@@ -2717,8 +3492,13 @@ function handleDownloadSelectedZip() {
             if (isUploading || uploadQueue.length === 0) return;
             
             isUploading = true;
-            const file = uploadQueue.shift();
-            
+            // const file = uploadQueue.shift(); // Old: just file object
+            const queueItem = uploadQueue.shift(); // New: { file: FileObject, path: "relative/path/filename.ext" }
+            const file = queueItem.file;
+            const clientRelativePath = queueItem.path; // This is the path relative to the dropped folder, or just filename
+            const overwriteAction = queueItem.overwriteAction || null; // Get overwrite action if set
+            const userSuggestedName = queueItem.userSuggestedName || null; // Get user suggested name if set
+
             const progressId = 'progress_' + Date.now() + Math.random().toString(36).substring(2,7);
             const progressHtml = `
                 <div class="progress-item" id="${progressId}">
@@ -2735,6 +3515,14 @@ function handleDownloadSelectedZip() {
             formData.append('action', 'upload');
             formData.append('csrf_token', csrfToken);
             formData.append('file', file);
+            formData.append('intendedSubPath', clientRelativePath); 
+            formData.append('currentDirectoryPath', currentDirectoryPath); 
+            if (overwriteAction) {
+                formData.append('overwrite_action', overwriteAction);
+            }
+            if (userSuggestedName) { // Send userSuggestedName if provided
+                formData.append('userSuggestedName', userSuggestedName);
+            }
             
             try {
                 const xhr = new XMLHttpRequest();
@@ -2751,35 +3539,80 @@ function handleDownloadSelectedZip() {
                 });
                 
                 xhr.addEventListener('load', () => {
+                    let requestHandled = false; 
+                    let uploadActuallySuccessful = false;
+                    let jsonData = null; // To store parsed result for use in setTimeout
+
                     if (xhr.status === 200) {
                         try {
-                            const result = JSON.parse(xhr.responseText);
-                            if (result.success) {
+                            jsonData = JSON.parse(xhr.responseText);
+                            if (jsonData.success === true) {
                                 if(progressStatus) progressStatus.textContent = 'Upload successful!';
                                 if(progressBarFill) progressBarFill.style.backgroundColor = 'var(--accent-color)';
-                                loadFiles(); // Reload files which will apply current sort
-                                updateStorageUsageDisplay(); // Update storage usage after upload
-                            } else {
-                                alert('Upload failed: ' + (result.error || 'Unknown error'));
-                                if(progressStatus) progressStatus.textContent = 'Error: ' + (result.error || 'Unknown');
+                                loadFiles(); 
+                                updateStorageUsageDisplay(); 
+                                requestHandled = true;
+                                uploadActuallySuccessful = true;
+                            } else if (jsonData.success === 'conflict') {
+                                if (window.confirm(jsonData.message + "\n\nWould you like to replace the existing file?")) {
+                                    uploadQueue.unshift({...queueItem, overwriteAction: 'replace' }); 
+                                } else {
+                                    // User chose NOT to replace, prompt for a new name or use server rename
+                                    let suggestedName = jsonData.filename;
+                                    const parts = jsonData.filename.split('.');
+                                    if (parts.length > 1) {
+                                        const ext = parts.pop();
+                                        suggestedName = parts.join('.') + ' (1).' + ext;
+                                    } else {
+                                        suggestedName = jsonData.filename + ' (1)';
+                                    }
+
+                                    const userNewName = window.prompt(
+                                        "File '" + jsonData.filename + "' already exists.\nEnter a new name for the uploaded file, or leave as is to have the server rename it (e.g., to '" + suggestedName + "').", 
+                                        suggestedName
+                                    );
+
+                                    if (userNewName === null) { // User pressed Cancel on the prompt
+                                        if(progressStatus) progressStatus.textContent = 'Upload cancelled for: ' + file.name;
+                                        if(progressBarFill) progressBarFill.style.backgroundColor = 'var(--danger-color)';
+                                        // setTimeout for removal will be handled below by !requestHandled logic
+                                    } else if (userNewName.trim() === "") { // User cleared the name and pressed OK - treat as server rename
+                                        uploadQueue.unshift({...queueItem, overwriteAction: 'rename' }); 
+                                    } else { // User entered a new name or accepted suggestion
+                                        uploadQueue.unshift({...queueItem, overwriteAction: 'rename', userSuggestedName: userNewName.trim() }); 
+                                    }
+                                }
+                                progressItemEl?.remove(); 
+                                requestHandled = true; 
+                            } else { 
+                                alert('Upload failed: ' + (jsonData.error || 'Unknown error'));
+                                if(progressStatus) progressStatus.textContent = 'Error: ' + (jsonData.error || 'Unknown');
                                 if(progressBarFill) progressBarFill.style.backgroundColor = 'var(--danger-color)';
+                                requestHandled = true;
                             }
-                        } catch (e) {
-                            alert('Upload failed: Invalid server response');
-                             if(progressStatus) progressStatus.textContent = 'Error: Invalid server response';
-                             if(progressBarFill) progressBarFill.style.backgroundColor = 'var(--danger-color)';
+                        } catch (e) { 
+                            alert('Upload failed: Invalid server response. ' + e.message);
+                            if(progressStatus) progressStatus.textContent = 'Error: Invalid server response';
+                            if(progressBarFill) progressBarFill.style.backgroundColor = 'var(--danger-color)';
+                            requestHandled = true;
                         }
-                    } else {
+                    } else { 
                          alert('Upload failed: Server returned status ' + xhr.status);
                          if(progressStatus) progressStatus.textContent = 'Error: Server status ' + xhr.status;
                          if(progressBarFill) progressBarFill.style.backgroundColor = 'var(--danger-color)';
+                         requestHandled = true; 
                     }
-                    setTimeout(() => {
-                        progressItemEl?.remove();
-                    }, xhr.status === 200 ? 2000 : 5000); // Keep success message a bit shorter
+
+                    // Cleanup and next step
+                    if (!requestHandled || (jsonData && jsonData.success !== 'conflict')) {
+                        // If it was a normal success/failure (not a conflict that re-queues and handles its own progress bar removal)
+                        setTimeout(() => {
+                            progressItemEl?.remove();
+                        }, uploadActuallySuccessful ? 2000 : 5000);
+                    } // else, if it was a conflict, progressItemEl was already removed or will be handled by cancel timeout
                     
                     isUploading = false;
-                    processUploadQueue();
+                    processUploadQueue(); 
                 });
                 
                 xhr.addEventListener('error', () => {
@@ -2813,12 +3646,13 @@ function handleDownloadSelectedZip() {
         }
         
         // *** MODIFIED FUNCTION: loadFiles ***
-        async function loadFiles(sortBy = 'date', sortOrder = 'desc') {
+        async function loadFiles(sortBy = 'date', sortOrder = 'desc', path = currentDirectoryPath) {
             const formData = new FormData();
             formData.append('action', 'list');
             formData.append('csrf_token', csrfToken);
             formData.append('sortBy', sortBy);
             formData.append('sortOrder', sortOrder);
+            formData.append('currentPath', path); // Send current path to backend
             
             try {
                 const response = await fetch('', {
@@ -2831,7 +3665,9 @@ function handleDownloadSelectedZip() {
                 }
                 const result = await response.json();
                 if (result.success) {
-                    displayFiles(result.files);
+                    currentDirectoryPath = result.currentPath; // Update current path from server response
+                    displayFiles(result.files, result.currentPath);
+                    updateBreadcrumbs(result.currentPath);
                 } else {
                     console.error('Error from server while listing files:', result.error);
                     alert('Could not load files: ' + (result.error || 'Unknown server error'));
@@ -2842,8 +3678,67 @@ function handleDownloadSelectedZip() {
             }
         }
         
+        function updateBreadcrumbs(path) {
+            const breadcrumbNav = document.getElementById('breadcrumbNav');
+            if (!breadcrumbNav) return;
+
+            if (path === '' || path === null || path === undefined) {
+                breadcrumbNav.style.display = 'none';
+                breadcrumbNav.innerHTML = '';
+                return;
+            }
+
+            breadcrumbNav.style.display = 'block';
+            breadcrumbNav.innerHTML = ''; // Clear previous breadcrumbs
+
+            const segments = path.split('/').filter(segment => segment !== '');
+            let currentPathForLink = '';
+
+            // Add Root link
+            const rootLink = document.createElement('a');
+            rootLink.href = '#';
+            rootLink.textContent = 'Root';
+            rootLink.style.textDecoration = 'none';
+            rootLink.style.color = 'var(--accent-color)';
+            rootLink.onclick = (e) => {
+                e.preventDefault();
+                currentDirectoryPath = '';
+                loadFiles();
+            };
+            breadcrumbNav.appendChild(rootLink);
+
+            segments.forEach((segment, index) => {
+                const separator = document.createElement('span');
+                separator.textContent = ' / ';
+                separator.style.margin = '0 0.25rem';
+                separator.style.color = 'var(--text-secondary)';
+                breadcrumbNav.appendChild(separator);
+
+                currentPathForLink += (currentPathForLink ? '/' : '') + segment;
+                if (index === segments.length - 1) { // Last segment is current folder, not a link
+                    const currentFolderText = document.createElement('span');
+                    currentFolderText.textContent = escapeHtml(segment);
+                    currentFolderText.style.color = 'var(--text-primary)';
+                    breadcrumbNav.appendChild(currentFolderText);
+                } else {
+                    const segmentLink = document.createElement('a');
+                    segmentLink.href = '#';
+                    segmentLink.textContent = escapeHtml(segment);
+                    segmentLink.style.textDecoration = 'none';
+                    segmentLink.style.color = 'var(--accent-color)';
+                    const pathForThisLink = currentPathForLink; // Capture path for this link's closure
+                    segmentLink.onclick = (e) => {
+                        e.preventDefault();
+                        currentDirectoryPath = pathForThisLink;
+                        loadFiles();
+                    };
+                    breadcrumbNav.appendChild(segmentLink);
+                }
+            });
+        }
+        
         // Display files
-        function displayFiles(files) {
+        function displayFiles(files, path) { // path parameter added
             const listView = document.getElementById('listView');
             const iconView = document.getElementById('iconView');
             const emptyState = document.getElementById('emptyState');
@@ -2889,66 +3784,81 @@ function handleDownloadSelectedZip() {
                 let clickHandler = '';
                 let videoOverlayHtml = '';
                 
-                if (file.canPreview) {
+                if (file.isDirectory) {
+                    const dirPath = escapeJs((path ? path + '/' : '') + file.name);
+                    clickHandler = `navigateToDirectory(\'${dirPath}\')`;
+                } else if (file.canPreview) {
+                    // Construct full relative path for file source URLs
+                    const fileRelativePath = (path ? path + '/' : '') + file.name;
+                    const fullyUrlEncodedFile = encodeURIComponent(fileRelativePath).replace(/'/g, "%27");
+                    const jsArgMediaUrl = escapeJs('files/' + fullyUrlEncodedFile);
+                    const jsArgRawFileName = escapeJs(fileRelativePath); // Send relative path for previews/ops
+
                     switch (file.previewType) {
                         case 'image':
-                            clickHandler = `openLightbox('${jsArgMediaUrl}', '${jsArgRawFileName}')`;
+                            clickHandler = `openLightbox(\'${jsArgMediaUrl}\', \'${jsArgRawFileName}\')`;
                             break;
                         case 'video':
-                            clickHandler = `openVideoPlayer('${jsArgMediaUrl}', '${jsArgRawFileName}')`;
+                            clickHandler = `openVideoPlayer(\'${jsArgMediaUrl}\', \'${jsArgRawFileName}\')`;
                             if (file.hasThumb) {
                                 videoOverlayHtml = '<div class="video-thumb-overlay">▶</div>';
                             }
                             break;
                         case 'pdf':
-                            clickHandler = `openPdfViewer('${jsArgMediaUrl}', '${jsArgRawFileName}')`;
+                            clickHandler = `openPdfViewer(\'${jsArgMediaUrl}\', \'${jsArgRawFileName}\')`;
                             break;
                         case 'text':
-                            clickHandler = `openTextViewer('${jsArgRawFileName}')`; // Uses raw name for AJAX
+                            clickHandler = `openTextViewer(\'${jsArgRawFileName}\')`; 
                             break;
                         case 'audio':
-                            clickHandler = `openAudioPlayer('${jsArgMediaUrl}', '${jsArgRawFileName}')`;
+                            clickHandler = `openAudioPlayer(\'${jsArgMediaUrl}\', \'${jsArgRawFileName}\')`;
                             break;
                         case 'zip':
-                            clickHandler = `openZipViewer('${jsArgRawFileName}')`; // Uses raw name for AJAX
+                            clickHandler = `openZipViewer(\'${jsArgRawFileName}\')`; 
                             break;
                         default:
-                            clickHandler = `window.location.href='${downloadFileHref}'`; 
+                            clickHandler = `window.location.href=\'?download=${fullyUrlEncodedFile}\'`
                     }
-                } else {
-                    clickHandler = `window.location.href='${downloadFileHref}'`;
+                } else { // Not a directory and cannot preview -> direct download
+                    const fileRelativePath = (path ? path + '/' : '') + file.name;
+                    const fullyUrlEncodedFile = encodeURIComponent(fileRelativePath).replace(/'/g, "%27");
+                    clickHandler = `window.location.href=\'?download=${fullyUrlEncodedFile}\'`;
                 }
                 
-                let thumbFileNameComponent = rawFileName;
-                if ((file.previewType === 'video' || file.previewType === 'pdf') && file.hasThumb) {
+                let thumbFileNameComponent = file.name;
+                let thumbBaseDir = (path ? path + '/' : '');
+                if (!file.isDirectory && (file.previewType === 'video' || file.previewType === 'pdf') && file.hasThumb) {
                     thumbFileNameComponent += '.jpg';
                 }
-                const fullyEncodedThumbNamePart = encodeURIComponent(thumbFileNameComponent).replace(/'/g, "%27");
+                // Thumbnails are always relative to the root of THUMBS_DIR, mirroring structure
+                const fullyEncodedThumbNamePart = encodeURIComponent(thumbBaseDir + thumbFileNameComponent).replace(/'/g, "%27");
                 const thumbSrcAttributeValue = `files/thumbs/${fullyEncodedThumbNamePart}?m=${file.modified}`;
 
+                const itemIdentifier = escapeJs((path ? path + '/' : '') + file.name); // Used for data-filename and checkbox value
+
                 return `
-                    <div class="file-item" data-filename="${jsArgRawFileName}">
+                    <div class="file-item" data-filename="${itemIdentifier}">
                         <div style="display: flex; align-items: center; margin-right: 10px;">
-                            <input type="checkbox" class="file-checkbox" value="${jsArgRawFileName}" onchange="handleFileSelectionChange()" style="width: 18px; height: 18px; cursor: pointer;">
+                            <input type="checkbox" class="file-checkbox" value="${itemIdentifier}" onchange="handleFileSelectionChange()" style="width: 18px; height: 18px; cursor: pointer;">
                         </div>
-                        <div class="file-info" onclick="${clickHandler}" title="Click to preview ${escapedHtmlName}">
-                            <div class="file-icon ${file.canPreview ? 'has-preview' : ''}">
-                                ${file.hasThumb ? 
-                                    `<img src="${thumbSrcAttributeValue}" alt="${escapedHtmlName}" loading="lazy">` : 
-                                    getFileIcon(rawFileName, file.extension)
+                        <div class="file-info" onclick="${clickHandler}" title="${file.isDirectory ? 'Open folder' : 'Click to preview'} ${escapedHtmlName}">
+                            <div class="file-icon ${!file.isDirectory && file.canPreview ? 'has-preview' : ''}">
+                                ${file.isDirectory ? getFileIcon(null, 'folder') :
+                                    (file.hasThumb ? 
+                                        `<img src="${thumbSrcAttributeValue}" alt="${escapedHtmlName}" loading="lazy">` :
+                                        getFileIcon(rawFileName, file.extension))
                                 }
                                 ${videoOverlayHtml} 
                             </div>
                             <div class="file-details">
                                 <h4>${escapedHtmlName}</h4>
-                                <p>${formatFileSize(file.size)} • ${formatDate(file.modified)}</p>
+                                <p>${formatFileSize(file.size)}${file.isDirectory ? ' • Folder' : ' • ' + formatDate(file.modified)}</p>
                             </div>
                         </div>
                         <div class="file-actions">
-                            <a href="${downloadFileHref}" class="btn btn-secondary icon-btn" title="Download ${escapedHtmlName}" onclick="event.stopPropagation()">↓</a>
-                            <?php if ($ALLOW_FILE_DELETION): ?>
-                            <button class="btn btn-danger icon-btn" onclick="event.stopPropagation(); deleteFile('${jsArgRawFileName}')" title="Delete ${escapedHtmlName}">×</button>
-                            <?php endif; ?>
+                            <button class="btn btn-secondary icon-btn" onclick="event.stopPropagation(); handleRenameClick(\'${itemIdentifier}\', \'${escapeJs(rawFileName)}\')" title="Rename ${escapedHtmlName}">✏️</button>
+                            <a href="${file.isDirectory ? '?download_folder=' + encodeURIComponent(itemIdentifier) : '?download=' + encodeURIComponent(itemIdentifier)}" class="btn btn-secondary icon-btn" title="Download ${escapedHtmlName}" onclick="event.stopPropagation()">↓</a>
+                            ${(allowFileDeletion) ? `<button class="btn btn-danger icon-btn" onclick="event.stopPropagation(); deleteFile(\'${itemIdentifier}\')" title="Delete ${escapedHtmlName}">×</button>` : ''}
                         </div>
                     </div>
                 `;
@@ -2957,67 +3867,72 @@ function handleDownloadSelectedZip() {
             // Icon view
             iconView.innerHTML = files.map(file => {
                 const rawFileName = file.name;
-
                 const escapedHtmlName = escapeHtml(rawFileName);
-                const jsEscapedRawFileName = escapeJs(rawFileName);
-                const fullyUrlEncodedRawFileName = encodeURIComponent(rawFileName).replace(/'/g, "%27");
-
-                const mediaFileResourceUrl = 'files/' + fullyUrlEncodedRawFileName;
-                const downloadFileHref = `?download=${fullyUrlEncodedRawFileName}`;
-
-                const jsArgMediaUrl = escapeJs(mediaFileResourceUrl);
-                const jsArgRawFileName = jsEscapedRawFileName;
 
                 let previewHandler = '';
                 let videoIconOverlayHtml = '';
-                
-                if (file.canPreview) {
+
+                if (file.isDirectory) {
+                    const dirPath = escapeJs((path ? path + '/' : '') + file.name);
+                    previewHandler = `onclick="navigateToDirectory(\'${dirPath}\')"`;
+                } else if (file.canPreview) {
+                    const fileRelativePath = (path ? path + '/' : '') + file.name;
+                    const fullyUrlEncodedFile = encodeURIComponent(fileRelativePath).replace(/'/g, "%27");
+                    const jsArgMediaUrl = escapeJs('files/' + fullyUrlEncodedFile);
+                    const jsArgRawFileName = escapeJs(fileRelativePath);
+
                     switch (file.previewType) {
                         case 'image':
-                            previewHandler = `onclick="openLightbox('${jsArgMediaUrl}', '${jsArgRawFileName}')"`;
+                            previewHandler = `onclick="openLightbox(\'${jsArgMediaUrl}\', \'${jsArgRawFileName}\')"`;
                             break;
                         case 'video':
-                            previewHandler = `onclick="openVideoPlayer('${jsArgMediaUrl}', '${jsArgRawFileName}')"`;
+                            previewHandler = `onclick="openVideoPlayer(\'${jsArgMediaUrl}\', \'${jsArgRawFileName}\')"`;
                             if (file.hasThumb) {
                                 videoIconOverlayHtml = '<div class="video-thumb-overlay">▶</div>';
                             }
                             break;
                         case 'pdf':
-                            previewHandler = `onclick="openPdfViewer('${jsArgMediaUrl}', '${jsArgRawFileName}')"`;
+                            previewHandler = `onclick="openPdfViewer(\'${jsArgMediaUrl}\', \'${jsArgRawFileName}\')"`;
                             break;
                         case 'text':
-                            previewHandler = `onclick="openTextViewer('${jsArgRawFileName}')"`;
+                            previewHandler = `onclick="openTextViewer(\'${jsArgRawFileName}\')"`;
                             break;
                         case 'audio':
-                            previewHandler = `onclick="openAudioPlayer('${jsArgMediaUrl}', '${jsArgRawFileName}')"`;
+                            previewHandler = `onclick="openAudioPlayer(\'${jsArgMediaUrl}\', \'${jsArgRawFileName}\')"`;
                             break;
                         case 'zip':
-                            previewHandler = `onclick="openZipViewer('${jsArgRawFileName}')"`;
+                            previewHandler = `onclick="openZipViewer(\'${jsArgRawFileName}\')"`;
                             break;
                          default:
-                            previewHandler = `onclick="window.location.href='${downloadFileHref}'"`;
+                            previewHandler = `onclick="window.location.href=\'?download=${fullyUrlEncodedFile}\'";`
                     }
                 } else {
-                     previewHandler = `onclick="window.location.href='${downloadFileHref}'"`;
+                    const fileRelativePath = (path ? path + '/' : '') + file.name;
+                    const fullyUrlEncodedFile = encodeURIComponent(fileRelativePath).replace(/'/g, "%27");
+                    previewHandler = `onclick="window.location.href=\'?download=${fullyUrlEncodedFile}\'"`;
                 }
 
-                let thumbFileNameComponent = rawFileName;
-                if ((file.previewType === 'video' || file.previewType === 'pdf') && file.hasThumb) {
+                let thumbFileNameComponent = file.name;
+                let thumbBaseDir = (path ? path + '/' : '');
+                if (!file.isDirectory && (file.previewType === 'video' || file.previewType === 'pdf') && file.hasThumb) {
                     thumbFileNameComponent += '.jpg';
                 }
-                const fullyEncodedThumbNamePart = encodeURIComponent(thumbFileNameComponent).replace(/'/g, "%27");
+                const fullyEncodedThumbNamePart = encodeURIComponent(thumbBaseDir + thumbFileNameComponent).replace(/'/g, "%27");
                 const thumbSrcAttributeValue = `files/thumbs/${fullyEncodedThumbNamePart}?m=${file.modified}`;
                 
+                const itemIdentifier = escapeJs((path ? path + '/' : '') + file.name); // Used for data-filename and checkbox value
+
                 return `
-                    <div class="file-card" data-filename="${jsArgRawFileName}">
+                    <div class="file-card" data-filename="${itemIdentifier}">
                         <div style="position: absolute; top: 10px; left: 10px; z-index:1;">
-                            <input type="checkbox" class="file-checkbox" value="${jsArgRawFileName}" onchange="handleFileSelectionChange()" style="width: 18px; height: 18px; cursor: pointer;">
+                            <input type="checkbox" class="file-checkbox" value="${itemIdentifier}" onchange="handleFileSelectionChange()" style="width: 18px; height: 18px; cursor: pointer;">
                         </div>
-                        <div class="file-preview" ${previewHandler} title="Click to preview ${escapedHtmlName}">
+                        <div class="file-preview" ${previewHandler} title="${file.isDirectory ? 'Open folder' : 'Click to preview'} ${escapedHtmlName}">
                             <div class="thumbnail-wrapper">
-                                ${file.hasThumb ? 
-                                    `<img src="${thumbSrcAttributeValue}" alt="${escapedHtmlName}" loading="lazy">` : 
-                                    `<div class="file-icon-large">${getFileIcon(rawFileName, file.extension)}</div>`
+                                ${file.isDirectory ? `<div class="file-icon-large">${getFileIcon(null, 'folder')}</div>` :
+                                    (file.hasThumb ? 
+                                        `<img src="${thumbSrcAttributeValue}" alt="${escapedHtmlName}" loading="lazy">` :
+                                        `<div class="file-icon-large">${getFileIcon(rawFileName, file.extension)}</div>`)
                                 }
                                 ${videoIconOverlayHtml}
                             </div>
@@ -3025,10 +3940,9 @@ function handleDownloadSelectedZip() {
                         <h4>${escapedHtmlName}</h4>
                         <p>${formatFileSize(file.size)}</p>
                         <div class="file-card-actions">
-                            <a href="${downloadFileHref}" class="btn btn-secondary icon-btn" title="Download ${escapedHtmlName}">↓</a>
-                            <?php if ($ALLOW_FILE_DELETION): ?>
-                            <button class="btn btn-danger icon-btn" onclick="deleteFile('${jsArgRawFileName}')" title="Delete ${escapedHtmlName}">×</button>
-                            <?php endif; ?>
+                             <button class="btn btn-secondary icon-btn" onclick="event.stopPropagation(); handleRenameClick(\'${itemIdentifier}\', \'${escapeJs(rawFileName)}\')" title="Rename ${escapedHtmlName}">✏️</button>
+                             <a href="${file.isDirectory ? '?download_folder=' + encodeURIComponent(itemIdentifier) : '?download=' + encodeURIComponent(itemIdentifier)}" class="btn btn-secondary icon-btn" title="Download ${escapedHtmlName}">↓</a>
+                            ${(allowFileDeletion) ? `<button class="btn btn-danger icon-btn" onclick="deleteFile(\'${itemIdentifier}\')" title="Delete ${escapedHtmlName}">×</button>` : ''}
                         </div>
                     </div>
                 `;
@@ -3039,14 +3953,38 @@ function handleDownloadSelectedZip() {
             updateActionButtons(); // Update buttons based on current selection
         }
         
-        // Delete file
-        async function deleteFile(filename) {
-            if (!confirm(`Are you sure you want to delete ${filename}?`)) return;
+        // Delete file or folder
+        async function deleteFile(itemIdentifier) { // itemIdentifier can be file or folder path
+            // Try to determine if it's a folder based on the data we have in the DOM or itemIdentifier structure
+            // This is a client-side heuristic. The server will make the final determination.
+            let isLikelyFolder = false;
+            const fileElement = document.querySelector(`[data-filename="${itemIdentifier.replace(/"/g, '\\"')}"]`);
+            if (fileElement) {
+                const detailsText = fileElement.querySelector('.file-details p')?.textContent;
+                if (detailsText && detailsText.toLowerCase().includes('folder')) {
+                    isLikelyFolder = true;
+                } else if (!itemIdentifier.includes('.') && itemIdentifier.split('/').pop().indexOf('.') === -1) {
+                    // No extension in the last part of the path could also indicate a folder
+                    // This is less reliable than checking the displayed text
+                    // Consider if there's a direct 'isDirectory' flag available on the element or from JS data if we restructure
+                    // For now, if detailsText doesn't say Folder, and it has no obvious file extension, it *might* be a folder.
+                    // This simple check might be enough if combined with the confirmation text.
+                    const namePart = itemIdentifier.split('/').pop();
+                    if (namePart.indexOf('.') === -1) isLikelyFolder = true; 
+                }
+            }
+
+            let confirmMessage = `Are you sure you want to delete '${itemIdentifier}'?`;
+            if (isLikelyFolder) {
+                confirmMessage += '\n\nWARNING: This will delete the folder and ALL its contents!';
+            }
+
+            if (!confirm(confirmMessage)) return;
             
             const formData = new FormData();
             formData.append('action', 'delete');
             formData.append('csrf_token', csrfToken);
-            formData.append('filename', filename);
+            formData.append('filename', itemIdentifier);
             
             try {
                 const response = await fetch('', {
@@ -3082,6 +4020,7 @@ function handleDownloadSelectedZip() {
             if(lightboxImageElement) {
                 // Reset previous transformations
                 lightboxImageElement.style.transform = 'scale(1) translate(0px, 0px)';
+                lightboxImageElement.style.transformOrigin = 'center center'; // Initial origin
                 lightboxZoomLevel = 1;
                 lightboxTranslateX = 0;
                 lightboxTranslateY = 0;
@@ -3110,7 +4049,7 @@ function handleDownloadSelectedZip() {
             if (event) { // If called by a click event
                 if (event.target === lightboxImageElement || event.target.closest('.lightbox-controls')) {
                     // Click was on the image or the new controls, do not close.
-                    event.stopPropagation(); // Prevent lightbox click handler from closing
+                    if(event) event.stopPropagation(); // Prevent lightbox click handler from closing
                     return;
                 }
                 if (event.target !== lightbox && event.target !== closeButton) {
@@ -3130,6 +4069,7 @@ function handleDownloadSelectedZip() {
                 if (lightboxImageElement) {
                     lightboxImageElement.removeEventListener('mousedown', startLightboxPan);
                     lightboxImageElement.style.transform = 'scale(1) translate(0px, 0px)'; // Reset transform
+                    lightboxImageElement.style.transformOrigin = 'center center'; // Reset origin
                     lightboxImageElement.style.cursor = 'grab';
                     lightboxImageElement.src = ''; // Clear image to free memory
                 }
@@ -3156,100 +4096,59 @@ function handleDownloadSelectedZip() {
             const minZoom = 0.5;
             const maxZoom = 5;
             
-            const rect = lightboxImageElement.getBoundingClientRect();
-            let mouseX = rect.width / 2; // Default to center for button zoom
-            let mouseY = rect.height / 2;
+            // const lightbox = document.getElementById('lightbox'); // No longer needed for mouse relative to lightbox
+            // const lightboxRect = lightbox.getBoundingClientRect();
+            // let mouseXInLightbox = event.clientX - lightboxRect.left; 
+            // let mouseYInLightbox = event.clientY - lightboxRect.top;
 
-            if (event && event.type === 'wheel') {
-                mouseX = event.clientX - rect.left;
-                mouseY = event.clientY - rect.top;
-            }
+            // if (event && event.type !== 'wheel') { 
+            //     mouseXInLightbox = lightboxRect.width / 2;
+            //     mouseYInLightbox = lightboxRect.height / 2;
+            // }
 
             const prevZoomLevel = lightboxZoomLevel;
 
             if (typeof customZoomLevel === 'number') {
                 lightboxZoomLevel = customZoomLevel;
-            } else if (event && event.deltaY < 0) { // Zoom in with wheel
+            } else if (event && event.deltaY < 0) { 
                 lightboxZoomLevel = Math.min(lightboxZoomLevel + zoomIntensity, maxZoom);
-            } else if (event && event.deltaY > 0) { // Zoom out with wheel
+            } else if (event && event.deltaY > 0) { 
                 lightboxZoomLevel = Math.max(lightboxZoomLevel - zoomIntensity, minZoom);
             }
-            // If customZoomLevel is used, or no event for wheel, this part is skipped for button actions
-            // unless we explicitly pass a zoom direction for buttons too.
-            // Let's make buttons set specific zoom levels or increments.
 
+            // Always keep transform-origin center for centered zoom
+            if (lightboxImageElement) lightboxImageElement.style.transformOrigin = 'center center';
+
+            // If zoom level brings it back to 1x or less, reset any panning.
             if (lightboxZoomLevel <= 1) { 
                 lightboxTranslateX = 0;
                 lightboxTranslateY = 0;
-                // lightboxImageElement.style.transformOrigin = `center center`; // Already default
-            } else if (event && event.type === 'wheel') { // Only adjust pan for wheel zoom to keep mouse point fixed
-                const imageX = (mouseX - lightboxTranslateX) / prevZoomLevel;
-                const imageY = (mouseY - lightboxTranslateY) / prevZoomLevel;
-                lightboxTranslateX = mouseX - imageX * lightboxZoomLevel;
-                lightboxTranslateY = mouseY - imageY * lightboxZoomLevel;
-            }
+            } 
+            // When zooming (not from a button action that resets), maintain current pan if already panned.
+            // The scaling will happen around the center of the currently panned view.
+            // No explicit new translation calculation needed here for centered zoom relative to mouse.
             
             applyLightboxTransform();
         }
 
         function lightboxZoomIn(event) {
-            if(event) event.stopPropagation(); // Prevent lightbox click handler
+            if(event) event.stopPropagation(); 
             if (!lightboxImageElement) return;
-            const newZoomLevel = Math.min(lightboxZoomLevel + 0.2, 5); // Larger step for buttons
-            // To zoom towards center of view:
-            // We need to adjust translation based on current center and new zoom level
-            const rect = lightboxImageElement.getBoundingClientRect();
-            const viewportCenterX = rect.left + rect.width / 2;
-            const viewportCenterY = rect.top + rect.height / 2;
-            
-            // Current image center in viewport coordinates
-            const imageCurrentCenterX = lightboxTranslateX + (lightboxImageElement.offsetWidth * lightboxZoomLevel / 2);
-            const imageCurrentCenterY = lightboxTranslateY + (lightboxImageElement.offsetHeight * lightboxZoomLevel / 2);
-
-
-            if (newZoomLevel > 1 && lightboxZoomLevel <=1) { // if we are zooming from 1x or less to >1x
-                 // Center the image before applying further zoom adjustments for subsequent clicks
-                const imageNaturalWidth = lightboxImageElement.naturalWidth;
-                const imageNaturalHeight = lightboxImageElement.naturalHeight;
-                const containerWidth = lightboxImageElement.parentElement.clientWidth; // lightbox div
-                const containerHeight = lightboxImageElement.parentElement.clientHeight;
-                
-                // Calculate initial centering translation if needed
-                // This is complex because the image is already scaled.
-                // For simplicity, if zooming from 1x, reset pan before calculating new pan.
-                // lightboxTranslateX = 0;
-                // lightboxTranslateY = 0;
-            }
-
-
-            lightboxZoomLevel = newZoomLevel;
-            if (lightboxZoomLevel <= 1) {
-                lightboxTranslateX = 0;
-                lightboxTranslateY = 0;
-            }
-            // No specific mouse point to track for button zoom, usually zooms to center of current view or image.
-            // For now, it will zoom to current center due to how applyLightboxTransform works without mouse point adjustments.
-            applyLightboxTransform();
+            // Pass null for event to indicate it's a button click, handleLightboxZoom will use its default (centered) behavior
+            handleLightboxZoom(null, Math.min(lightboxZoomLevel + 0.2, 5)); 
         }
 
         function lightboxZoomOut(event) {
             if(event) event.stopPropagation();
             if (!lightboxImageElement) return;
-            lightboxZoomLevel = Math.max(lightboxZoomLevel - 0.2, 0.5);
-            if (lightboxZoomLevel <= 1) {
-                lightboxTranslateX = 0;
-                lightboxTranslateY = 0;
-            }
-            applyLightboxTransform();
+            handleLightboxZoom(null, Math.max(lightboxZoomLevel - 0.2, 0.5));
         }
 
         function lightboxResetZoom(event) {
             if(event) event.stopPropagation();
             if (!lightboxImageElement) return;
-            lightboxZoomLevel = 1;
-            lightboxTranslateX = 0;
-            lightboxTranslateY = 0;
-            applyLightboxTransform();
+            // Ensure translation is also reset by handleLightboxZoom when level is 1
+            handleLightboxZoom(null, 1); 
         }
 
         function startLightboxPan(event) {
@@ -3341,7 +4240,6 @@ function handleDownloadSelectedZip() {
                     
                     if (textContent) {
                         if (result.extension === 'md') {
-                            // Basic Markdown rendering - consider a library for more complex needs
                             textContent.innerHTML = `<div class="markdown-content">${renderMarkdown(escapeHtml(result.content))}</div>`;
                         } else {
                             textContent.innerHTML = `<pre>${escapeHtml(result.content)}</pre>`;
@@ -3352,11 +4250,13 @@ function handleDownloadSelectedZip() {
                     }
                     if(textModal) textModal.classList.add('active');
                 } else {
-                    alert('Failed to preview file: ' + (result.error || 'Unknown error'));
+                    alert('Failed to preview text file: ' + (result.error || 'Unknown error') + '.\nAttempting to download instead.');
+                    window.location.href = `?download=${encodeURIComponent(rawFileName)}`;
                 }
             } catch (error) {
-                console.error('Error previewing file:', error);
-                alert('Failed to preview file. Check console.');
+                console.error('Error previewing text file:', error);
+                alert('Failed to load text preview. Attempting to download instead.');
+                window.location.href = `?download=${encodeURIComponent(rawFileName)}`;
             }
         }
         
@@ -3454,11 +4354,13 @@ function handleDownloadSelectedZip() {
                     }
                     if(zipModal) zipModal.classList.add('active');
                 } else {
-                    alert('Failed to preview ZIP: ' + (result.error || 'Unknown error'));
+                    alert('Failed to preview ZIP: ' + (result.error || 'Unknown error') + '.\nAttempting to download instead.');
+                    window.location.href = `?download=${encodeURIComponent(rawFileName)}`;
                 }
             } catch (error) {
                 console.error('Error previewing ZIP:', error);
-                alert('Failed to preview ZIP file. Check console.');
+                alert('Failed to load ZIP preview. Attempting to download instead.');
+                window.location.href = `?download=${encodeURIComponent(rawFileName)}`;
             }
         }
         
@@ -3536,13 +4438,17 @@ function handleDownloadSelectedZip() {
         }
         
         function getFileIcon(filename, ext) {
-            if (!ext) {
+            if (ext === 'folder') return '📁'; // Prioritize folder icon
+
+            if (!ext && filename) { // If ext is not provided but filename is, try to derive ext
                 const parts = filename.split('.');
                 if (parts.length > 1) {
                     ext = parts.pop().toLowerCase();
                 } else {
                     ext = ''; // No extension
                 }
+            } else if (!ext) {
+                ext = ''; // Ensure ext is a string if both are null/undefined
             }
             
             const icons = {
@@ -3859,6 +4765,101 @@ function handleDownloadSelectedZip() {
             } catch (error) {
                 console.error('Logout error:', error);
                 alert('An error occurred during logout.');
+            }
+        }
+
+        function navigateToDirectory(path) {
+            currentDirectoryPath = path;
+            loadFiles(); // Will use the updated currentDirectoryPath
+        }
+
+        async function handleCreateFolderClick() {
+            const folderName = window.prompt("Enter name for the new folder:");
+            if (folderName === null || folderName.trim() === "") {
+                if (folderName !== null) { // Only alert if they entered empty string, not if they cancelled
+                    alert("Folder name cannot be empty.");
+                }
+                return;
+            }
+
+            // Basic client-side validation for invalid characters (server will do more)
+            if (/[/\\:\*\?"<>\|\.]/.test(folderName) || folderName === ".." || folderName === ".") {
+                alert("Folder name contains invalid characters or is not allowed.");
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('action', 'create_folder');
+            formData.append('csrf_token', csrfToken);
+            formData.append('folderName', folderName.trim());
+            formData.append('currentPath', currentDirectoryPath);
+
+            try {
+                const response = await fetch('', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                if (result.success) {
+                    loadFiles(); // Refresh the current directory to show the new folder
+                } else {
+                    alert('Failed to create folder: ' + (result.error || 'Unknown error'));
+                }
+            } catch (error) {
+                console.error('Error creating folder:', error);
+                alert('An error occurred while creating the folder.');
+            }
+        }
+
+        // *** NEW FUNCTION: handleRenameClick ***
+        async function handleRenameClick(itemIdentifier, currentName) {
+            event.stopPropagation(); // Prevent triggering click on parent elements
+            const newName = prompt(`Enter new name for "${currentName}":`, currentName);
+
+            if (newName === null || newName.trim() === "") {
+                if (newName !== null) alert("New name cannot be empty.");
+                return;
+            }
+
+            if (newName === currentName) {
+                // No change, do nothing
+                return;
+            }
+
+            // Basic client-side validation for invalid characters (server will do more)
+            if (/[/\\:\*\?"<>\|]/.test(newName)) {
+                alert("New name contains invalid characters.");
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('action', 'rename');
+            formData.append('csrf_token', csrfToken);
+            formData.append('itemIdentifier', itemIdentifier); // This is the full path relative to FILES_DIR
+            formData.append('newName', newName.trim());
+
+            try {
+                const response = await fetch('', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                if (result.success) {
+                    loadFiles(); // Refresh file list
+                    // Consider updating currentDirectoryPath if a folder in the breadcrumb path was renamed
+                    // This might require more sophisticated state management or specific feedback from the server.
+                    // For now, a simple loadFiles() will refresh the current view.
+                    if (currentDirectoryPath.startsWith(itemIdentifier + '/')) {
+                        // If we are inside a folder that got renamed, its path might need an update
+                        // This is a tricky case. For now, a full refresh might be the simplest.
+                        // Or, the server could return the new path of the renamed item if it was a dir.
+                    }
+                } else {
+                    alert('Rename failed: ' + (result.error || 'Unknown error'));
+                }
+            } catch (error) {
+                console.error('Error renaming item:', error);
+                alert('An error occurred while renaming the item.');
             }
         }
     </script>
